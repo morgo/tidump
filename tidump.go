@@ -7,58 +7,132 @@ import (
 	"strings"
 	"time"
 	"bytes"
+	"math"
 
 	_ "github.com/go-sql-driver/mysql"
 )
 
 /*
- Ideas:
+ TODO:
 
- 1) The whole backup can be lock-less by initially setting a @@tidb_snapshot.
+ * Make consistent snapshot, not with locks but
+   set a @@tidb_snapshot.
+ * Add virtual column support.
+ * Add support for _tidb_rowid
+ * Add parallel execution
+ * Add S3 Interface
+ * Add compression
+ * Add progress reporting
 
- 2) Every TiDB table has a numeric primary key (sometimes it is hidden
- as _tidb_rowid, but it's there!).  This means that data can be divided
- into chunks very easily!
-
- 3) I will start with ~parity of mydumper format for export, before
- working on parallel execution.
-
- 4) After parallel execution, work on s3 interface.
-
- 5) Work on compression
+LIMITATIONS:
+* Does not backup mysql system tables (plan to do GRANT syntax only)
+* Only backups up complete databases
 
 */
+
+const (
+ dumpdir = "dumpdir"
+ connection = "root@tcp(localhost:4000)/"
+ bufferLimit = 1024 /* in bytes: the goal of every batch insert.  Will excced because of escape characters and comma delimiter */
+ fileLimit = 100*1024 /* Goal of every file is "100K", based on compressed data_length reported by TiDB */
+)
 
 func main() {
 
 	start := time.Now()
 
-	db, err := sql.Open("mysql", "root@tcp(localhost:4000)/")
+	db, err := sql.Open("mysql", connection)
 	check(err)
 
-	// Find all the tables in the system
+	/*
+	 Find all the tables in the system.
+	 TODO:
+	 * Support regex
+	 * Get True Primary Key Name
+	*/
 
-	tables, err := db.Query("SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA')")
+	 // avg row length may be zero.
+	tables, err := db.Query("SELECT TABLE_SCHEMA, TABLE_NAME, AVG_ROW_LENGTH, DATA_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA')")
 	check(err)
 
-	os.Mkdir("dumpdir", 0700)
+	os.Mkdir(dumpdir, 0700)
 
 	for tables.Next() {
 		var schema string
 		var table string
-		err = tables.Scan(&schema, &table)
+		var avgRowLength int
+		var dataLength uint64
+		err = tables.Scan(&schema, &table, &avgRowLength, &dataLength)
 		check(err)
 
-		dumpCreateTable(db, schema, table)
-		dumpTableData(db, schema, table) /* @todo: dump ranges */
+		dumpTable(db,schema,table, "_tidb_rowid", avgRowLength, dataLength)
 
 	}
 
 	t := time.Now()
 	elapsed := t.Sub(start)
 	fmt.Printf("Execution took %v\n", elapsed)
+//	writeMetaDataFile(start, t);
 
-	// @todo: write the metadata file.
+}
+/*
+func writeMetaDataFile(start time, finish time) {
+	// TODO: write meta data file
+}
+*/
+
+func discoverTableMinMax(db *sql.DB, schema string, table string, primaryKey string) (min int, max int) {
+
+		query := fmt.Sprintf("SELECT MIN(%s) as min, MAX(%s) max FROM `%s`.`%s`", primaryKey, primaryKey, schema, table)
+		err := db.QueryRow(query).Scan(&min, &max)
+		check(err)
+
+		return
+		
+}
+
+func discoverRowsPerChunk(avgRowLength int, limit int) int {
+	return int(math.Abs(math.Floor(float64(limit) / float64(avgRowLength))))
+}
+
+
+func dumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength uint64) {
+
+	dumpCreateTable(db, schema, table)
+
+	if dataLength < fileLimit {
+		dumpTableData(db, schema, table, primaryKey, -1, -1) // small table
+	} else {
+
+		/*
+		 We need to figure out based on the reported avgRowLength,
+		 how many rows per chunk.  We can then quer the max+min values,
+		 and add some unncessary off by one handling.
+		*/
+
+		rowsPerChunk := discoverRowsPerChunk(avgRowLength, fileLimit)
+		min, max := discoverTableMinMax(db, schema, table, primaryKey)
+
+
+		for i := min; i < max; i += rowsPerChunk {
+
+			start := i
+			end   := i + rowsPerChunk - 1
+
+			if i == min {
+				start = -1
+			}
+
+			if end > max {
+				end = -1
+			}
+
+			fmt.Printf("Table: %s.%s.  Start: %d End: %d\n", schema, table, start, end)
+			dumpTableData(db, schema, table, primaryKey, start, end)
+
+		}
+
+	}
 
 }
 
@@ -84,12 +158,32 @@ func dumpCreateTable(db *sql.DB, schema string, table string) {
 
 }
 
-func dumpTableData(db *sql.DB, schema string, table string) {
+func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, start int, end int) {
 
-	query := fmt.Sprintf("SELECT * FROM `%s`.`%s`", schema, table) // @todo: add _tidb_rowid if present
-	file := fmt.Sprintf("dumpdir/%s.%s.sql", schema, table)
 	var buffer bytes.Buffer
-	bufferLimit := 1024; /* 1024 bytes: will excced because of escape characters and comma delimiter */
+	var where, query string
+	var prefix = ""
+
+	if start == -1 && end != -1 {
+		where = fmt.Sprintf("WHERE %s < %d", primaryKey, end)
+		prefix = fmt.Sprintf(".%d", 0)
+	} else if start != -1 && end != -1 {
+		where = fmt.Sprintf("WHERE %s BETWEEN %d AND %d", primaryKey, start, end)
+		prefix = fmt.Sprintf(".%d", start)
+	} else if start != -1 && end == -1 {
+		where = fmt.Sprintf("WHERE %s > %d", primaryKey, start)
+		prefix = fmt.Sprintf(".%d", start)
+	}
+
+	if primaryKey == "_tidb_rowid" {
+		query = fmt.Sprintf("SELECT *, _tidb_rowid FROM `%s`.`%s` %s ", schema, table, where)
+	} else {
+		query = fmt.Sprintf("SELECT * FROM `%s`.`%s` %s ", schema, table, where)
+	}
+
+	fmt.Println(query)
+
+	file := fmt.Sprintf("dumpdir/%s.%s%s.sql", schema, table, prefix)
 
 	// ------------- Dump Data ------------------- //
 
