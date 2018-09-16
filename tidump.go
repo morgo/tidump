@@ -8,7 +8,12 @@ import (
 	"os"
 	"strings"
 	"time"
+	"path/filepath"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -31,7 +36,11 @@ const (
 	dumpdir     = "dumpdir"
 	bufferLimit = 1024       /* in bytes: the goal of every batch insert.  Will excced because of escape characters and comma delimiter */
 	fileLimit   = 100 * 1024 /* Goal of every file is "100K", based on compressed data_length reported by TiDB */
+	awsS3Bucket = "backups.tocker.ca"
+	awsS3Region = "us-east-1"
 )
+
+var StartTime = time.Now()
 
 func main() {
 
@@ -52,16 +61,37 @@ func main() {
 	 In future this might be configurable.
 	*/
 
-	setTiDBSnapshot(db)
+	checkAndSetTiDB(db)
+
 
 	/*
-	 Find all the tables in the system.
-	 TODO:
-	 * Support regex
+	 @TODO: Add a Regex to filter the list of tables.
+
+	 This query can be improved by adding more meta data to the server:
+
+	 Create information_schema.TIDB_TABLE_PRIMARY_KEY
+	 https://github.com/pingcap/tidb/issues/7714
+
 	*/
 
-	query := "SELECT TABLE_SCHEMA, TABLE_NAME, if(AVG_ROW_LENGTH=0,100,AVG_ROW_LENGTH) as AVG_ROW_LENGTH, DATA_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA')";
+	query := `SELECT
+	t.table_schema,
+	t.table_name,
+	if(AVG_ROW_LENGTH=0,100,AVG_ROW_LENGTH) as avg_row_length,
+	t.data_length,
+	IFNULL(pk.likely_primary_key,'_tidb_rowid'),
+	c.insertable
+FROM INFORMATION_SCHEMA.TABLES t
+LEFT JOIN 
+(SELECT table_schema, table_name, column_name as likely_primary_key FROM information_schema.key_column_usage WHERE constraint_name='PRIMARY') pk
+ON t.table_schema = pk.table_schema AND t.table_name=pk.table_name
+LEFT JOIN 
+(SELECT table_schema, table_name, GROUP_CONCAT(COLUMN_NAME)as insertable FROM information_schema.COLUMNS WHERE extra NOT LIKE '%%GENERATED%%' GROUP BY table_schema, table_name) c
+ON t.table_schema = c.table_schema AND t.table_name=c.table_name
+WHERE t.TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA')`;
+
 	tables, err := db.Query(query)
+	log.Debug(query)
 
 	if err != nil {
 		log.Fatal("Could not read tables from information_schema.  Check MYSQL_CONNECTION is configured correctly.")
@@ -75,17 +105,15 @@ func main() {
 		var table string
 		var avgRowLength int
 		var dataLength uint64
+		var likelyPrimaryKey string
+		var insertableColumns string
 
-		err = tables.Scan(&schema, &table, &avgRowLength, &dataLength)
+		err = tables.Scan(&schema, &table, &avgRowLength, &dataLength, &likelyPrimaryKey, &insertableColumns)
 		check(err)
 
-		/*
-		 Create information_schema.TIDB_TABLE_PRIMARY_KEY
-		 https://github.com/pingcap/tidb/issues/7714
-		*/
+		primaryKey := discoverPrimaryKey(db, schema, table, likelyPrimaryKey)
 
-		primaryKey := discoverPrimaryKey(db, schema, table)
-		dumpTable(db, schema, table, primaryKey, avgRowLength, dataLength)
+		dumpTable(db, schema, table, primaryKey, avgRowLength, dataLength, insertableColumns)
 
 	}
 
@@ -106,7 +134,15 @@ func writeMetaDataFile(start time, finish time) {
 }
 */
 
-func setTiDBSnapshot(db *sql.DB) {
+func checkAndSetTiDB(db *sql.DB) {
+
+	/*
+	 Check that the minimum version is TiDB 2.1.
+	 information_schema.tables was not accurate
+	 until RC2.
+	*/
+
+	db.Exec("SET group_concat_max_len = 1024 * 1024")
 
 	query := "SET tidb_snapshot = NOW() - INTERVAL 1 SECOND";
 
@@ -119,9 +155,15 @@ func setTiDBSnapshot(db *sql.DB) {
 
 }
 
-func discoverPrimaryKey(db *sql.DB, schema string, table string) string {
 
-	columnName := "_tidb_rowid"
+/*
+ Hopefully this nonsense one day becomes obsolete.
+
+ Create information_schema.TIDB_TABLE_PRIMARY_KEY
+ https://github.com/pingcap/tidb/issues/7714
+*/
+
+func discoverPrimaryKey(db *sql.DB, schema string, table string, likelyPrimaryKey string) (columnName string) {
 
 	// Guess the primary key of the table.
 	query := fmt.Sprintf("SELECT _tidb_rowid FROM %s.%s LIMIT 1", schema, table)
@@ -129,10 +171,9 @@ func discoverPrimaryKey(db *sql.DB, schema string, table string) string {
 	log.Debug(query)
 
 	if err != nil {
-		query = fmt.Sprintf("SELECT column_name FROM information_schema.key_column_usage WHERE constraint_name='PRIMARY' AND table_schema='%s' AND table_name='%s'", schema, table)
-		err = db.QueryRow(query).Scan(&columnName)
-		log.Debug(query)
-		check(err)
+		columnName = likelyPrimaryKey
+	} else {
+		columnName = "_tidb_rowid"
 	}
 
 	return columnName
@@ -154,28 +195,10 @@ func discoverRowsPerChunk(avgRowLength int, limit int) int {
 	return int(math.Abs(math.Floor(float64(limit) / float64(avgRowLength))))
 }
 
-func discoverInsertableColumns(db *sql.DB, schema string, table string) (c string) {
 
-	/*
-	 Retrieve a list of columns which are non-generated.
-	 This is important for creating a restorable dump file.
-	*/
-
-	db.Exec("SET group_concat_max_len = 1024 * 1024")
-	query := fmt.Sprintf("SELECT GROUP_CONCAT(COLUMN_NAME)as c FROM information_schema.COLUMNS where TABLE_SCHEMA='%s' and TABLE_NAME='%s' AND extra NOT LIKE '%%GENERATED%%'", schema, table)
-	err := db.QueryRow(query).Scan(&c)
-	log.Debug(query)
-	check(err)
-
-	return
-
-}
-
-func dumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength uint64) {
+func dumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength uint64, insertableCols string) {
 
 	dumpCreateTable(db, schema, table)
-
-	insertableCols := discoverInsertableColumns(db, schema, table)
 
 	if dataLength < fileLimit {
 		dumpTableData(db, schema, table, primaryKey, insertableCols, -1, -1) // small table
@@ -227,11 +250,12 @@ func dumpCreateTable(db *sql.DB, schema string, table string) {
 	f, err := os.Create(file)
 	check(err)
 
-	n, err := f.WriteString(fmt.Sprintf("%s;\n", createTable))
-	log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
+	_, err = f.WriteString(fmt.Sprintf("%s;\n", createTable))
+//	log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
 	check(err)
 
 	f.Close()
+	copyFileToS3(file)
 
 }
 
@@ -300,9 +324,9 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 
 		if buffer.Len()+len(values) > bufferLimit {
 			buffer.WriteString(";\n")
-			n, err := buffer.WriteTo(f)
+			_, err := buffer.WriteTo(f)
 
-			log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
+//			log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
 			check(err)
 			buffer.Reset()
 		}
@@ -320,13 +344,14 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 
 	if buffer.Len() > 0 {
 		buffer.WriteString(";\n")
-		n, err := buffer.WriteTo(f)
-		log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
+		_, err := buffer.WriteTo(f)
+//		log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
 		check(err)
 		buffer.Reset()
 	}
 
 	f.Close()
+	copyFileToS3(file)
 
 }
 
@@ -343,6 +368,36 @@ func quoteIdentifier(identifier string) string {
 	return fmt.Sprintf("`%s`", identifier)
 }
 
+func copyFileToS3(filename string) {
+
+	awsS3Prefix := fmt.Sprintf("tidb-%s", StartTime)	
+
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatal(fmt.Sprintf("Could not open file for upload", filename))
+	}
+	defer file.Close()
+
+	//select Region to use.
+	conf := aws.Config{Region: aws.String(awsS3Region)}
+	sess := session.New(&conf)
+	svc := s3manager.NewUploader(sess)
+
+	log.Debug("Uploading file to S3...")
+
+	result, err := svc.Upload(&s3manager.UploadInput{
+		Bucket: aws.String(awsS3Bucket),
+		Key:    aws.String(fmt.Sprintf("%s/%s", awsS3Prefix, filepath.Base(filename))),
+		Body:   file,
+	})
+	if err != nil {
+		fmt.Println("error", err)
+		os.Exit(1)
+	}
+
+	log.Debug(fmt.Sprintf("Successfully uploaded %s to %s\n", filename, result.Location))
+
+}
 
 func escape(source string) string {
 	var j int = 0
