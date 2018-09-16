@@ -8,15 +8,15 @@ import (
 	"os"
 	"strings"
 	"time"
+	log "github.com/sirupsen/logrus"
 
 	_ "github.com/go-sql-driver/mysql"
 )
 
 /*
  TODO:
-
- * Add parallel execution
  * Add S3 Interface
+ * Add parallel execution
  * Add compression
  * Add progress reporting
  * Add a debug/logging package.
@@ -29,7 +29,6 @@ LIMITATIONS:
 
 const (
 	dumpdir     = "dumpdir"
-	connection  = "root@tcp(localhost:4000)/"
 	bufferLimit = 1024       /* in bytes: the goal of every batch insert.  Will excced because of escape characters and comma delimiter */
 	fileLimit   = 100 * 1024 /* Goal of every file is "100K", based on compressed data_length reported by TiDB */
 )
@@ -37,12 +36,19 @@ const (
 func main() {
 
 	start := time.Now()
+	db, err := sql.Open("mysql", os.Getenv("TIDUMP_MYSQL_CONNECTION"))
 
-	db, err := sql.Open("mysql", connection)
-	check(err)
+	log.SetLevel(log.InfoLevel)
+//	log.SetLevel(log.DebugLevel)
+
+	if err != nil {
+		log.Fatal("Could not connect to MySQL.  Please make sure you've set MYSQL_CONNECTION.")
+	}
+
 
 	/*
 	 Set the tidb_snapshot to NOW()-INTERVAL 1 SECOND.
+	 before doing anything else.
 	 In future this might be configurable.
 	*/
 
@@ -54,8 +60,12 @@ func main() {
 	 * Support regex
 	*/
 
-	tables, err := db.Query("SELECT TABLE_SCHEMA, TABLE_NAME, if(AVG_ROW_LENGTH=0,100,AVG_ROW_LENGTH) as AVG_ROW_LENGTH, DATA_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA')")
-	check(err)
+	query := "SELECT TABLE_SCHEMA, TABLE_NAME, if(AVG_ROW_LENGTH=0,100,AVG_ROW_LENGTH) as AVG_ROW_LENGTH, DATA_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA')";
+	tables, err := db.Query(query)
+
+	if err != nil {
+		log.Fatal("Could not read tables from information_schema.  Check MYSQL_CONNECTION is configured correctly.")
+	}
 
 	os.Mkdir(dumpdir, 0700)
 
@@ -81,7 +91,11 @@ func main() {
 
 	t := time.Now()
 	elapsed := t.Sub(start)
-	fmt.Printf("Execution took %v\n", elapsed)
+
+	log.WithFields(log.Fields{		
+		"elapsed": elapsed,
+	}).Info("Complete")
+	
 	//	writeMetaDataFile(start, t);
 
 }
@@ -93,7 +107,16 @@ func writeMetaDataFile(start time, finish time) {
 */
 
 func setTiDBSnapshot(db *sql.DB) {
-	db.Exec("SET tidb_snapshot = NOW() - INTERVAL 1 SECOND")
+
+	query := "SET tidb_snapshot = NOW() - INTERVAL 1 SECOND";
+
+	_, err := db.Exec(query)
+	log.Debug(query)
+
+	if err != nil {
+		log.Fatal("Could not set tidb_snapshot.  Check MySQL_CONNECTION is configured and server is TiDB.")
+	}
+
 }
 
 func discoverPrimaryKey(db *sql.DB, schema string, table string) string {
@@ -103,10 +126,12 @@ func discoverPrimaryKey(db *sql.DB, schema string, table string) string {
 	// Guess the primary key of the table.
 	query := fmt.Sprintf("SELECT _tidb_rowid FROM %s.%s LIMIT 1", schema, table)
 	_, err := db.Query(query)
+	log.Debug(query)
 
 	if err != nil {
 		query = fmt.Sprintf("SELECT column_name FROM information_schema.key_column_usage WHERE constraint_name='PRIMARY' AND table_schema='%s' AND table_name='%s'", schema, table)
 		err = db.QueryRow(query).Scan(&columnName)
+		log.Debug(query)
 		check(err)
 	}
 
@@ -118,6 +143,7 @@ func discoverTableMinMax(db *sql.DB, schema string, table string, primaryKey str
 
 	query := fmt.Sprintf("SELECT MIN(%s) as min, MAX(%s) max FROM `%s`.`%s`", primaryKey, primaryKey, schema, table)
 	err := db.QueryRow(query).Scan(&min, &max)
+	log.Debug(query)
 	check(err)
 
 	return
@@ -137,8 +163,8 @@ func discoverInsertableColumns(db *sql.DB, schema string, table string) (c strin
 
 	db.Exec("SET group_concat_max_len = 1024 * 1024")
 	query := fmt.Sprintf("SELECT GROUP_CONCAT(COLUMN_NAME)as c FROM information_schema.COLUMNS where TABLE_SCHEMA='%s' and TABLE_NAME='%s' AND extra NOT LIKE '%%GENERATED%%'", schema, table)
-	fmt.Println(query)
 	err := db.QueryRow(query).Scan(&c)
+	log.Debug(query)
 	check(err)
 
 	return
@@ -177,7 +203,7 @@ func dumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRo
 				end = -1
 			}
 
-			fmt.Printf("Table: %s.%s.  Start: %d End: %d\n", schema, table, start, end)
+			log.Debug(fmt.Sprintf("Table: %s.%s.  Start: %d End: %d\n", schema, table, start, end))
 			dumpTableData(db, schema, table, primaryKey, insertableCols, start, end)
 
 		}
@@ -195,13 +221,14 @@ func dumpCreateTable(db *sql.DB, schema string, table string) {
 	file := fmt.Sprintf("dumpdir/%s.%s-schema.sql", schema, table)
 
 	err := db.QueryRow(query).Scan(&fakeTable, &createTable)
+	log.Debug(query)
 	check(err)
 
 	f, err := os.Create(file)
 	check(err)
 
 	n, err := f.WriteString(fmt.Sprintf("%s;\n", createTable))
-	debug(fmt.Sprintf("wrote %d bytes\n", n))
+	log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
 	check(err)
 
 	f.Close()
@@ -231,13 +258,12 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 		query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` %s ", insertableCols, schema, table, where)
 	}
 
-	fmt.Println(query)
-
 	file := fmt.Sprintf("dumpdir/%s.%s%s.sql", schema, table, prefix)
 
 	// ------------- Dump Data ------------------- //
 
 	rows, err := db.Query(query)
+	log.Debug(query)
 	check(err)
 
 	f, err := os.Create(file)
@@ -275,7 +301,8 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 		if buffer.Len()+len(values) > bufferLimit {
 			buffer.WriteString(";\n")
 			n, err := buffer.WriteTo(f)
-			debug(fmt.Sprintf("wrote %d bytes\n", n))
+
+			log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
 			check(err)
 			buffer.Reset()
 		}
@@ -294,7 +321,7 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 	if buffer.Len() > 0 {
 		buffer.WriteString(";\n")
 		n, err := buffer.WriteTo(f)
-		debug(fmt.Sprintf("wrote %d bytes\n", n))
+		log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
 		check(err)
 		buffer.Reset()
 	}
@@ -311,13 +338,11 @@ func Map(vs []string, f func(string) string) []string {
 	return vsm
 }
 
-func debug(message string) {
-	//	fmt.Printf(message)
-}
 
 func quoteIdentifier(identifier string) string {
 	return fmt.Sprintf("`%s`", identifier)
 }
+
 
 func escape(source string) string {
 	var j int = 0
@@ -370,6 +395,7 @@ func escape(source string) string {
 
 func check(e error) {
 	if e != nil {
+		log.Fatal(e)
 		panic(e)
 	}
 }
