@@ -20,11 +20,11 @@ import (
 
 /*
  TODO:
- * Add S3 Interface
+ * Delete local files after copy to S3
+ * Add the bucketname and prefix as a configurable.
  * Add parallel execution
  * Add compression
  * Add progress reporting
- * Add a debug/logging package.
 
 LIMITATIONS:
 * Does not backup mysql system tables (plan to do GRANT syntax only)
