@@ -46,9 +46,9 @@ func main() {
 		check(err)
 
 		sqlSchemaFile := fmt.Sprintf("dumpdir/%s.%s-schema.sql", schema, table)
-		sqlDataFile   := fmt.Sprintf("dumpdir/%s.%s.sql", schema, table)
+		sqlDataFile := fmt.Sprintf("dumpdir/%s.%s.sql", schema, table)
 		sqlDumpSchema := fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", schema, table)
-		sqlDumpData   := fmt.Sprintf("SELECT * FROM `%s`.`%s`", schema, table) // @todo: add _tidb_rowid if present
+		sqlDumpData := fmt.Sprintf("SELECT * FROM `%s`.`%s`", schema, table) // @todo: add _tidb_rowid if present
 
 		// -------------- Dump Schema ----------------- //
 
@@ -60,9 +60,9 @@ func main() {
 		fSchema, err := os.Create(sqlSchemaFile)
 		check(err)
 
-		n3,err := fSchema.WriteString(fmt.Sprintf("%s;\n", createTable))
-	    debug(fmt.Sprintf("wrote %d bytes\n", n3))
-	    check(err)
+		n3, err := fSchema.WriteString(fmt.Sprintf("%s;\n", createTable))
+		debug(fmt.Sprintf("wrote %d bytes\n", n3))
+		check(err)
 
 		fSchema.Close()
 
@@ -110,10 +110,9 @@ func main() {
 			values := strings.Join(result, ",")
 			insertStmt := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s);\n", table, colsstr, values)
 
-			n3,err := fData.WriteString(insertStmt)
-		    debug(fmt.Sprintf("wrote %d bytes\n", n3))
+			n3, err := fData.WriteString(insertStmt)
+			debug(fmt.Sprintf("wrote %d bytes\n", n3))
 			check(err)
-
 
 		}
 
@@ -132,7 +131,7 @@ func Map(vs []string, f func(string) string) []string {
 }
 
 func debug(message string) {
-//	fmt.Printf(message)
+	//	fmt.Printf(message)
 }
 
 func quoteIdentifier(identifier string) string {
