@@ -67,36 +67,36 @@ func dumpCreateTable(db *sql.DB, schema string, table string) {
 	var fakeTable string
 	var createTable string
 
-	sqlSchemaFile := fmt.Sprintf("dumpdir/%s.%s-schema.sql", schema, table)
-	sqlDumpSchema := fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", schema, table)
+	query := fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", schema, table)
+	file := fmt.Sprintf("dumpdir/%s.%s-schema.sql", schema, table)
 
-	err := db.QueryRow(sqlDumpSchema).Scan(&fakeTable, &createTable)
+	err := db.QueryRow(query).Scan(&fakeTable, &createTable)
 	check(err)
 
-	debug(fmt.Sprintf("===Writing File %s.%s-schema.sql ===\n", schema, table))
-
-	fSchema, err := os.Create(sqlSchemaFile)
+	f, err := os.Create(file)
 	check(err)
 
-	n3, err := fSchema.WriteString(fmt.Sprintf("%s;\n", createTable))
-	debug(fmt.Sprintf("wrote %d bytes\n", n3))
+	n, err := f.WriteString(fmt.Sprintf("%s;\n", createTable))
+	debug(fmt.Sprintf("wrote %d bytes\n", n))
 	check(err)
 
-	fSchema.Close()
+	f.Close()
 
 }
 
 func dumpTableData(db *sql.DB, schema string, table string) {
 
-	sqlDataFile := fmt.Sprintf("dumpdir/%s.%s.sql", schema, table)
-	sqlDumpData := fmt.Sprintf("SELECT * FROM `%s`.`%s`", schema, table) // @todo: add _tidb_rowid if present
+	query := fmt.Sprintf("SELECT * FROM `%s`.`%s`", schema, table) // @todo: add _tidb_rowid if present
+	file := fmt.Sprintf("dumpdir/%s.%s.sql", schema, table)
+	var buffer bytes.Buffer
+	bufferLimit := 1024; /* 1024 bytes: will excced because of escape characters and comma delimiter */
 
 	// ------------- Dump Data ------------------- //
 
-	rows, err := db.Query(sqlDumpData)
+	rows, err := db.Query(query)
 	check(err)
 
-	f, err := os.Create(sqlDataFile)
+	f, err := os.Create(file)
 	check(err)
 
 	cols, err := rows.Columns()
@@ -110,11 +110,6 @@ func dumpTableData(db *sql.DB, schema string, table string) {
 	for i, _ := range rawResult {
 		dest[i] = &rawResult[i] // Put pointers to each string in the interface slice
 	}
-
-	var buffer bytes.Buffer
-	bufferLimit := 1024; /* 1024 bytes: will excced because of escape characters and comma delimiter */
-
-	fmt.Printf("Buffer fill goal is %d bytes\n", bufferLimit)
 
 	for rows.Next() {
 		err = rows.Scan(dest...)
@@ -136,7 +131,7 @@ func dumpTableData(db *sql.DB, schema string, table string) {
 		if buffer.Len() + len(values) > bufferLimit {
 			buffer.WriteString(";\n")
 			n, err := buffer.WriteTo(f)
-			fmt.Printf("wrote %d bytes\n", n)
+			debug(fmt.Sprintf("wrote %d bytes\n", n))
 			check(err)
 			buffer.Reset()
 		}
@@ -155,7 +150,7 @@ func dumpTableData(db *sql.DB, schema string, table string) {
 	if buffer.Len() > 0 {
 		buffer.WriteString(";\n")
 		n, err := buffer.WriteTo(f)
-		fmt.Printf("wrote %d bytes\n", n)
+		debug(fmt.Sprintf("wrote %d bytes\n", n))
 		check(err)
 		buffer.Reset()
 	}
