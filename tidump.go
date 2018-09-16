@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
+	log "github.com/sirupsen/logrus"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
-	"path/filepath"
-	log "github.com/sirupsen/logrus"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -25,6 +25,7 @@ import (
  * Add parallel execution
  * Add compression
  * Add progress reporting
+ * Improve escaping function (don't quote integers!)
 
 LIMITATIONS:
 * Does not backup mysql system tables (plan to do GRANT syntax only)
@@ -33,27 +34,38 @@ LIMITATIONS:
 */
 
 const (
-	dumpdir     = "dumpdir"
-	bufferLimit = 1024       /* in bytes: the goal of every batch insert.  Will excced because of escape characters and comma delimiter */
-	fileLimit   = 100 * 1024 /* Goal of every file is "100K", based on compressed data_length reported by TiDB */
-	awsS3Bucket = "backups.tocker.ca"
-	awsS3Region = "us-east-1"
+	dumpdir = "dumpdir"
 )
 
 var StartTime = time.Now()
+var MySQLConnectionString, AwsS3Bucket, AwsS3BucketPrefix, AwsS3Region string
+var FileTargetSize, BulkInsertLimit uint64
+
+func getenv(key, fallback string) string {
+	value := os.Getenv(key)
+	if len(value) == 0 {
+		return fallback
+	}
+	return value
+}
 
 func main() {
 
-	start := time.Now()
-	db, err := sql.Open("mysql", os.Getenv("TIDUMP_MYSQL_CONNECTION"))
+	MySQLConnectionString = getenv("TIDUMP_MYSQL_CONNECTION", "root@tcp(localhost:4000)/")
+	AwsS3Bucket = getenv("AWS_S3_BUCKET", "backups.tocker.ca")
+	AwsS3Region = getenv("AWS_S3_REGION", "us-east-1")
+	AwsS3BucketPrefix = getenv("AWS_S3_BUCKET_PREFIX", "blah")
+	FileTargetSize = 100 * 1024 // uint64(getenv("AWS_S3_FILE_TARGET_SIZE", string(100 * 1024))) // 100KiB
+	BulkInsertLimit = 1024      // uint64(getenv("BULK_INSERT_LIMIT", string(1024))) // 1KiB
+
+	db, err := sql.Open("mysql", MySQLConnectionString)
 
 	log.SetLevel(log.InfoLevel)
-//	log.SetLevel(log.DebugLevel)
+	//	log.SetLevel(log.DebugLevel)
 
 	if err != nil {
 		log.Fatal("Could not connect to MySQL.  Please make sure you've set MYSQL_CONNECTION.")
 	}
-
 
 	/*
 	 Set the tidb_snapshot to NOW()-INTERVAL 1 SECOND.
@@ -62,7 +74,6 @@ func main() {
 	*/
 
 	checkAndSetTiDB(db)
-
 
 	/*
 	 @TODO: Add a Regex to filter the list of tables.
@@ -88,7 +99,7 @@ ON t.table_schema = pk.table_schema AND t.table_name=pk.table_name
 LEFT JOIN 
 (SELECT table_schema, table_name, GROUP_CONCAT(COLUMN_NAME)as insertable FROM information_schema.COLUMNS WHERE extra NOT LIKE '%%GENERATED%%' GROUP BY table_schema, table_name) c
 ON t.table_schema = c.table_schema AND t.table_name=c.table_name
-WHERE t.TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA')`;
+WHERE t.TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA')`
 
 	tables, err := db.Query(query)
 	log.Debug(query)
@@ -118,12 +129,12 @@ WHERE t.TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA'
 	}
 
 	t := time.Now()
-	elapsed := t.Sub(start)
+	elapsed := t.Sub(StartTime)
 
-	log.WithFields(log.Fields{		
+	log.WithFields(log.Fields{
 		"elapsed": elapsed,
 	}).Info("Complete")
-	
+
 	//	writeMetaDataFile(start, t);
 
 }
@@ -144,7 +155,7 @@ func checkAndSetTiDB(db *sql.DB) {
 
 	db.Exec("SET group_concat_max_len = 1024 * 1024")
 
-	query := "SET tidb_snapshot = NOW() - INTERVAL 1 SECOND";
+	query := "SET tidb_snapshot = NOW() - INTERVAL 1 SECOND"
 
 	_, err := db.Exec(query)
 	log.Debug(query)
@@ -154,7 +165,6 @@ func checkAndSetTiDB(db *sql.DB) {
 	}
 
 }
-
 
 /*
  Hopefully this nonsense one day becomes obsolete.
@@ -191,16 +201,15 @@ func discoverTableMinMax(db *sql.DB, schema string, table string, primaryKey str
 
 }
 
-func discoverRowsPerChunk(avgRowLength int, limit int) int {
-	return int(math.Abs(math.Floor(float64(limit) / float64(avgRowLength))))
+func discoverRowsPerChunk(avgRowLength int, fileTargetSize uint64) int {
+	return int(math.Abs(math.Floor(float64(fileTargetSize) / float64(avgRowLength))))
 }
-
 
 func dumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength uint64, insertableCols string) {
 
 	dumpCreateTable(db, schema, table)
 
-	if dataLength < fileLimit {
+	if dataLength < FileTargetSize {
 		dumpTableData(db, schema, table, primaryKey, insertableCols, -1, -1) // small table
 	} else {
 
@@ -210,7 +219,7 @@ func dumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRo
 		 and add some unncessary off by one handling.
 		*/
 
-		rowsPerChunk := discoverRowsPerChunk(avgRowLength, fileLimit)
+		rowsPerChunk := discoverRowsPerChunk(avgRowLength, FileTargetSize)
 		min, max := discoverTableMinMax(db, schema, table, primaryKey)
 
 		for i := min; i < max; i += rowsPerChunk {
@@ -251,7 +260,7 @@ func dumpCreateTable(db *sql.DB, schema string, table string) {
 	check(err)
 
 	_, err = f.WriteString(fmt.Sprintf("%s;\n", createTable))
-//	log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
+	//	log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
 	check(err)
 
 	f.Close()
@@ -322,11 +331,11 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 
 		values := fmt.Sprintf("(%s)", strings.Join(result, ","))
 
-		if buffer.Len()+len(values) > bufferLimit {
+		if uint64(buffer.Len()+len(values)) > BulkInsertLimit {
 			buffer.WriteString(";\n")
 			_, err := buffer.WriteTo(f)
 
-//			log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
+			//			log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
 			check(err)
 			buffer.Reset()
 		}
@@ -345,7 +354,7 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 	if buffer.Len() > 0 {
 		buffer.WriteString(";\n")
 		_, err := buffer.WriteTo(f)
-//		log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
+		//		log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
 		check(err)
 		buffer.Reset()
 	}
@@ -363,14 +372,11 @@ func Map(vs []string, f func(string) string) []string {
 	return vsm
 }
 
-
 func quoteIdentifier(identifier string) string {
 	return fmt.Sprintf("`%s`", identifier)
 }
 
 func copyFileToS3(filename string) {
-
-	awsS3Prefix := fmt.Sprintf("tidb-%s", StartTime)	
 
 	file, err := os.Open(filename)
 	if err != nil {
@@ -379,15 +385,15 @@ func copyFileToS3(filename string) {
 	defer file.Close()
 
 	//select Region to use.
-	conf := aws.Config{Region: aws.String(awsS3Region)}
+	conf := aws.Config{Region: aws.String(AwsS3Region)}
 	sess := session.New(&conf)
 	svc := s3manager.NewUploader(sess)
 
 	log.Debug("Uploading file to S3...")
 
 	result, err := svc.Upload(&s3manager.UploadInput{
-		Bucket: aws.String(awsS3Bucket),
-		Key:    aws.String(fmt.Sprintf("%s/%s", awsS3Prefix, filepath.Base(filename))),
+		Bucket: aws.String(AwsS3Bucket),
+		Key:    aws.String(fmt.Sprintf("%s/%s", AwsS3BucketPrefix, filepath.Base(filename))),
 		Body:   file,
 	})
 	if err != nil {
