@@ -1,13 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"time"
-	"bytes"
-	"math"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -15,14 +15,11 @@ import (
 /*
  TODO:
 
- * Make consistent snapshot, not with locks but
-   set a @@tidb_snapshot.
- * Add virtual column support.
- * Add support for _tidb_rowid
  * Add parallel execution
  * Add S3 Interface
  * Add compression
  * Add progress reporting
+ * Add a debug/logging package.
 
 LIMITATIONS:
 * Does not backup mysql system tables (plan to do GRANT syntax only)
@@ -31,10 +28,10 @@ LIMITATIONS:
 */
 
 const (
- dumpdir = "dumpdir"
- connection = "root@tcp(localhost:4000)/"
- bufferLimit = 1024 /* in bytes: the goal of every batch insert.  Will excced because of escape characters and comma delimiter */
- fileLimit = 100*1024 /* Goal of every file is "100K", based on compressed data_length reported by TiDB */
+	dumpdir     = "dumpdir"
+	connection  = "root@tcp(localhost:4000)/"
+	bufferLimit = 1024       /* in bytes: the goal of every batch insert.  Will excced because of escape characters and comma delimiter */
+	fileLimit   = 100 * 1024 /* Goal of every file is "100K", based on compressed data_length reported by TiDB */
 )
 
 func main() {
@@ -45,63 +42,117 @@ func main() {
 	check(err)
 
 	/*
+	 Set the tidb_snapshot to NOW()-INTERVAL 1 SECOND.
+	 In future this might be configurable.
+	*/
+
+	setTiDBSnapshot(db)
+
+	/*
 	 Find all the tables in the system.
 	 TODO:
 	 * Support regex
-	 * Get True Primary Key Name
 	*/
 
-	 // avg row length may be zero.
-	tables, err := db.Query("SELECT TABLE_SCHEMA, TABLE_NAME, AVG_ROW_LENGTH, DATA_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA')")
+	tables, err := db.Query("SELECT TABLE_SCHEMA, TABLE_NAME, if(AVG_ROW_LENGTH=0,100,AVG_ROW_LENGTH) as AVG_ROW_LENGTH, DATA_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA')")
 	check(err)
 
 	os.Mkdir(dumpdir, 0700)
 
 	for tables.Next() {
+
 		var schema string
 		var table string
 		var avgRowLength int
 		var dataLength uint64
+
 		err = tables.Scan(&schema, &table, &avgRowLength, &dataLength)
 		check(err)
 
-		dumpTable(db,schema,table, "_tidb_rowid", avgRowLength, dataLength)
+		/*
+		 Create information_schema.TIDB_TABLE_PRIMARY_KEY
+		 https://github.com/pingcap/tidb/issues/7714
+		*/
+
+		primaryKey := discoverPrimaryKey(db, schema, table)
+		dumpTable(db, schema, table, primaryKey, avgRowLength, dataLength)
 
 	}
 
 	t := time.Now()
 	elapsed := t.Sub(start)
 	fmt.Printf("Execution took %v\n", elapsed)
-//	writeMetaDataFile(start, t);
+	//	writeMetaDataFile(start, t);
 
 }
+
 /*
 func writeMetaDataFile(start time, finish time) {
 	// TODO: write meta data file
 }
 */
 
+func setTiDBSnapshot(db *sql.DB) {
+	db.Exec("SET tidb_snapshot = NOW() - INTERVAL 1 SECOND")
+}
+
+func discoverPrimaryKey(db *sql.DB, schema string, table string) string {
+
+	columnName := "_tidb_rowid"
+
+	// Guess the primary key of the table.
+	query := fmt.Sprintf("SELECT _tidb_rowid FROM %s.%s LIMIT 1", schema, table)
+	_, err := db.Query(query)
+
+	if err != nil {
+		query = fmt.Sprintf("SELECT column_name FROM information_schema.key_column_usage WHERE constraint_name='PRIMARY' AND table_schema='%s' AND table_name='%s'", schema, table)
+		err = db.QueryRow(query).Scan(&columnName)
+		check(err)
+	}
+
+	return columnName
+
+}
+
 func discoverTableMinMax(db *sql.DB, schema string, table string, primaryKey string) (min int, max int) {
 
-		query := fmt.Sprintf("SELECT MIN(%s) as min, MAX(%s) max FROM `%s`.`%s`", primaryKey, primaryKey, schema, table)
-		err := db.QueryRow(query).Scan(&min, &max)
-		check(err)
+	query := fmt.Sprintf("SELECT MIN(%s) as min, MAX(%s) max FROM `%s`.`%s`", primaryKey, primaryKey, schema, table)
+	err := db.QueryRow(query).Scan(&min, &max)
+	check(err)
 
-		return
-		
+	return
+
 }
 
 func discoverRowsPerChunk(avgRowLength int, limit int) int {
 	return int(math.Abs(math.Floor(float64(limit) / float64(avgRowLength))))
 }
 
+func discoverInsertableColumns(db *sql.DB, schema string, table string) (c string) {
+
+	/*
+	 Retrieve a list of columns which are non-generated.
+	 This is important for creating a restorable dump file.
+	*/
+
+	db.Exec("SET group_concat_max_len = 1024 * 1024")
+	query := fmt.Sprintf("SELECT GROUP_CONCAT(COLUMN_NAME)as c FROM information_schema.COLUMNS where TABLE_SCHEMA='%s' and TABLE_NAME='%s' AND extra NOT LIKE '%%GENERATED%%'", schema, table)
+	fmt.Println(query)
+	err := db.QueryRow(query).Scan(&c)
+	check(err)
+
+	return
+
+}
 
 func dumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength uint64) {
 
 	dumpCreateTable(db, schema, table)
 
+	insertableCols := discoverInsertableColumns(db, schema, table)
+
 	if dataLength < fileLimit {
-		dumpTableData(db, schema, table, primaryKey, -1, -1) // small table
+		dumpTableData(db, schema, table, primaryKey, insertableCols, -1, -1) // small table
 	} else {
 
 		/*
@@ -113,11 +164,10 @@ func dumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRo
 		rowsPerChunk := discoverRowsPerChunk(avgRowLength, fileLimit)
 		min, max := discoverTableMinMax(db, schema, table, primaryKey)
 
-
 		for i := min; i < max; i += rowsPerChunk {
 
 			start := i
-			end   := i + rowsPerChunk - 1
+			end := i + rowsPerChunk - 1
 
 			if i == min {
 				start = -1
@@ -128,7 +178,7 @@ func dumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRo
 			}
 
 			fmt.Printf("Table: %s.%s.  Start: %d End: %d\n", schema, table, start, end)
-			dumpTableData(db, schema, table, primaryKey, start, end)
+			dumpTableData(db, schema, table, primaryKey, insertableCols, start, end)
 
 		}
 
@@ -158,7 +208,7 @@ func dumpCreateTable(db *sql.DB, schema string, table string) {
 
 }
 
-func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, start int, end int) {
+func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, insertableCols string, start int, end int) {
 
 	var buffer bytes.Buffer
 	var where, query string
@@ -176,9 +226,9 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, s
 	}
 
 	if primaryKey == "_tidb_rowid" {
-		query = fmt.Sprintf("SELECT *, _tidb_rowid FROM `%s`.`%s` %s ", schema, table, where)
+		query = fmt.Sprintf("SELECT %s, _tidb_rowid FROM `%s`.`%s` %s ", insertableCols, schema, table, where)
 	} else {
-		query = fmt.Sprintf("SELECT * FROM `%s`.`%s` %s ", schema, table, where)
+		query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` %s ", insertableCols, schema, table, where)
 	}
 
 	fmt.Println(query)
@@ -222,7 +272,7 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, s
 
 		values := fmt.Sprintf("(%s)", strings.Join(result, ","))
 
-		if buffer.Len() + len(values) > bufferLimit {
+		if buffer.Len()+len(values) > bufferLimit {
 			buffer.WriteString(";\n")
 			n, err := buffer.WriteTo(f)
 			debug(fmt.Sprintf("wrote %d bytes\n", n))
@@ -252,7 +302,6 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, s
 	f.Close()
 
 }
-
 
 func Map(vs []string, f func(string) string) []string {
 	vsm := make([]string, len(vs))
