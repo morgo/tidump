@@ -3,9 +3,12 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	_ "github.com/go-sql-driver/mysql"
 	"os"
 	"strings"
+	"time"
+	"bytes"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 /*
@@ -20,11 +23,15 @@ import (
  3) I will start with ~parity of mydumper format for export, before
  working on parallel execution.
 
+ 4) After parallel execution, work on s3 interface.
+
+ 5) Work on compression
+
 */
 
 func main() {
 
-	// @TODO: record start time
+	start := time.Now()
 
 	db, err := sql.Open("mysql", "root@tcp(localhost:4000)/")
 	check(err)
@@ -39,88 +46,124 @@ func main() {
 	for tables.Next() {
 		var schema string
 		var table string
-		var fakeTable string
-		var createTable string
-
 		err = tables.Scan(&schema, &table)
 		check(err)
 
-		sqlSchemaFile := fmt.Sprintf("dumpdir/%s.%s-schema.sql", schema, table)
-		sqlDataFile := fmt.Sprintf("dumpdir/%s.%s.sql", schema, table)
-		sqlDumpSchema := fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", schema, table)
-		sqlDumpData := fmt.Sprintf("SELECT * FROM `%s`.`%s`", schema, table) // @todo: add _tidb_rowid if present
-
-		// -------------- Dump Schema ----------------- //
-
-		err = db.QueryRow(sqlDumpSchema).Scan(&fakeTable, &createTable)
-		check(err)
-
-		debug(fmt.Sprintf("===Writing File %s.%s-schema.sql ===\n", schema, table))
-
-		fSchema, err := os.Create(sqlSchemaFile)
-		check(err)
-
-		n3, err := fSchema.WriteString(fmt.Sprintf("%s;\n", createTable))
-		debug(fmt.Sprintf("wrote %d bytes\n", n3))
-		check(err)
-
-		fSchema.Close()
-
-		// ------------- Dump Data ------------------- //
-
-		rows, err := db.Query(sqlDumpData)
-		check(err)
-
-		// Create data file.
-		debug(fmt.Sprintf("===Writing File %s.%s.sql ===\n", schema, table))
-
-		fData, err := os.Create(sqlDataFile)
-		check(err)
-
-		cols, err := rows.Columns()
-		colsstr := strings.Join(Map(cols, quoteIdentifier), ",")
-
-		// Result is your slice string.
-		rawResult := make([][]byte, len(cols))
-		result := make([]string, len(cols))
-
-		dest := make([]interface{}, len(cols)) // A temporary interface{} slice
-		for i, _ := range rawResult {
-			dest[i] = &rawResult[i] // Put pointers to each string in the interface slice
-		}
-
-		for rows.Next() {
-			err = rows.Scan(dest...)
-			if err != nil {
-				fmt.Println("Failed to scan row", err)
-				return
-			}
-
-			for i, raw := range rawResult {
-				if raw == nil {
-					result[i] = "NULL"
-				} else {
-					result[i] = fmt.Sprintf("'%s'", escape(string(raw))) // @todo: get smart about escaping the value for numerics.
-				}
-			}
-
-			// @todo: this thing needs to know how to split at ~16MB
-			// rather than use a single-row insert.
-
-			values := strings.Join(result, ",")
-			insertStmt := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s);\n", table, colsstr, values)
-
-			n3, err := fData.WriteString(insertStmt)
-			debug(fmt.Sprintf("wrote %d bytes\n", n3))
-			check(err)
-
-		}
-
-		fData.Close()
+		dumpCreateTable(db, schema, table)
+		dumpTableData(db, schema, table) /* @todo: dump ranges */
 
 	}
 
+	t := time.Now()
+	elapsed := t.Sub(start)
+	fmt.Printf("Execution took %v\n", elapsed)
+
+	// @todo: write the metadata file.
+
 }
+
+func dumpCreateTable(db *sql.DB, schema string, table string) {
+
+	var fakeTable string
+	var createTable string
+
+	sqlSchemaFile := fmt.Sprintf("dumpdir/%s.%s-schema.sql", schema, table)
+	sqlDumpSchema := fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", schema, table)
+
+	err := db.QueryRow(sqlDumpSchema).Scan(&fakeTable, &createTable)
+	check(err)
+
+	debug(fmt.Sprintf("===Writing File %s.%s-schema.sql ===\n", schema, table))
+
+	fSchema, err := os.Create(sqlSchemaFile)
+	check(err)
+
+	n3, err := fSchema.WriteString(fmt.Sprintf("%s;\n", createTable))
+	debug(fmt.Sprintf("wrote %d bytes\n", n3))
+	check(err)
+
+	fSchema.Close()
+
+}
+
+func dumpTableData(db *sql.DB, schema string, table string) {
+
+	sqlDataFile := fmt.Sprintf("dumpdir/%s.%s.sql", schema, table)
+	sqlDumpData := fmt.Sprintf("SELECT * FROM `%s`.`%s`", schema, table) // @todo: add _tidb_rowid if present
+
+	// ------------- Dump Data ------------------- //
+
+	rows, err := db.Query(sqlDumpData)
+	check(err)
+
+	f, err := os.Create(sqlDataFile)
+	check(err)
+
+	cols, err := rows.Columns()
+	colsstr := strings.Join(Map(cols, quoteIdentifier), ",")
+
+	// Result is your slice string.
+	rawResult := make([][]byte, len(cols))
+	result := make([]string, len(cols))
+
+	dest := make([]interface{}, len(cols)) // A temporary interface{} slice
+	for i, _ := range rawResult {
+		dest[i] = &rawResult[i] // Put pointers to each string in the interface slice
+	}
+
+	var buffer bytes.Buffer
+	bufferLimit := 1024; /* 1024 bytes: will excced because of escape characters and comma delimiter */
+
+	fmt.Printf("Buffer fill goal is %d bytes\n", bufferLimit)
+
+	for rows.Next() {
+		err = rows.Scan(dest...)
+		if err != nil {
+			fmt.Println("Failed to scan row", err)
+			return
+		}
+
+		for i, raw := range rawResult {
+			if raw == nil {
+				result[i] = "NULL"
+			} else {
+				result[i] = fmt.Sprintf("'%s'", escape(string(raw))) // @todo: get smart about escaping the value for numerics.
+			}
+		}
+
+		values := fmt.Sprintf("(%s)", strings.Join(result, ","))
+
+		if buffer.Len() + len(values) > bufferLimit {
+			buffer.WriteString(";\n")
+			n, err := buffer.WriteTo(f)
+			fmt.Printf("wrote %d bytes\n", n)
+			check(err)
+			buffer.Reset()
+		}
+
+		if buffer.Len() == 0 {
+			buffer.WriteString(fmt.Sprintf("INSERT INTO %s (%s) VALUES \n%s", table, colsstr, values))
+		} else {
+			buffer.WriteString(",\n")
+			buffer.WriteString(values)
+		}
+
+	}
+
+	// Flush any remaining buffer
+
+	if buffer.Len() > 0 {
+		buffer.WriteString(";\n")
+		n, err := buffer.WriteTo(f)
+		fmt.Printf("wrote %d bytes\n", n)
+		check(err)
+		buffer.Reset()
+	}
+
+	f.Close()
+
+}
+
 
 func Map(vs []string, f func(string) string) []string {
 	vsm := make([]string, len(vs))
