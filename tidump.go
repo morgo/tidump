@@ -28,6 +28,7 @@ import (
  * Add compression
  * Improve escaping function (don't quote integers!)
  * Add regular expression to match databases
+ * Design structs to hold backup
 
 LIMITATIONS:
 * Does not backup mysql system tables (plan to do GRANT syntax only)
@@ -59,7 +60,7 @@ func main() {
 
 	configCheckAndSetTiDBSnapshot(db)
 
-	go publishStatus()
+	go publishStatus() // every 2 seconds
 
 	/*
 
@@ -116,25 +117,27 @@ WHERE
 
 	}
 
-	// There is no schema dump Wg, it happens syncronous.
+	/*
+	 The work is handled in goroutines.
+	 The dump routines write to the tmpdir, and then
+	 trigger a gorouting for copying to S3.
+	*/
 
 	TableDumpWg.Wait()
 	TableCopyWg.Wait()
 	SchemaDumpWg.Wait()
 	SchemaCopyWg.Wait()
 
-	// One final status line.
-
-	status()
+	status() // print status before exiting
 
 	t := time.Now()
 	elapsed := t.Sub(StartTime)
 
 	log.WithFields(log.Fields{
-		"elapsed": elapsed,
+		"StartTime":  StartTime,
+		"FinishTime": t,
+		"elapsed":    elapsed,
 	}).Info("Complete")
-
-	//	writeMetaDataFile(start, t);
 
 }
 
@@ -148,7 +151,7 @@ func getenv(key, fallback string) string {
 
 func status() {
 	log.Info(fmt.Sprintf("TotalFiles: %d, FilesDumpCompleted: %d, FilesCopyCompleted: %d", TotalFiles, FilesDumpCompleted, FilesCopyCompleted))
-	log.Info(fmt.Sprintf("BytesDumped: %d, Copied (success): %d, TmpSize: %d", BytesDumped, BytesCopied, (BytesDumped-BytesCopied)))
+	log.Info(fmt.Sprintf("BytesDumped: %d, Copied (success): %d, TmpSize: %d", BytesDumped, BytesCopied, (BytesDumped - BytesCopied)))
 
 }
 
@@ -161,12 +164,6 @@ func publishStatus() {
 
 }
 
-/*
-func writeMetaDataFile(start time, finish time) {
-	// TODO: write meta data file
-}
-*/
-
 func configCheckAndSetTiDBSnapshot(db *sql.DB) {
 
 	log.SetLevel(log.InfoLevel)
@@ -174,15 +171,15 @@ func configCheckAndSetTiDBSnapshot(db *sql.DB) {
 
 	AwsS3Bucket = getenv("TIDUMP_AWS_S3_BUCKET", "backups.tocker.ca")
 	AwsS3Region = getenv("TIDUMP_AWS_S3_REGION", "us-east-1")
-	FileTargetSize = 100 * 1024                      // uint64(getenv("AWS_S3_FILE_TARGET_SIZE", string(100 * 1024))) // 100KiB
-	BulkInsertLimit = 1024                           // uint64(getenv("BULK_INSERT_LIMIT", string(1024))) // 1KiB
-	TmpDirMax = 5 * 1024 * 1024 * 1024               // 5 GiB
+	FileTargetSize = 100 * 1024                      // TODO: uint64(getenv("AWS_S3_FILE_TARGET_SIZE", string(100 * 1024))) // 100KiB
+	BulkInsertLimit = 1024                           // TODO: uint64(getenv("BULK_INSERT_LIMIT", string(1024))) // 1KiB
+	TmpDirMax = 5 * 1024 * 1024 * 1024               // TODO: 5 GiB
 	TmpDir = getenv("TIDUMP_TMPDIR", "/tmp/tidump/") // TODO: use mktemp
 
 	os.Mkdir(TmpDir, 0700)
 
 	/*
-	 Check that the minimum version is TiDB 2.1.
+	 TODO: Check that the minimum version is TiDB 2.1.
 	 information_schema.tables was not accurate
 	 until RC2.
 	*/
@@ -242,6 +239,11 @@ func discoverRowsPerFile(avgRowLength int, fileTargetSize uint64) int {
 	return int(math.Abs(math.Floor(float64(fileTargetSize) / float64(avgRowLength))))
 }
 
+/*
+ TODO: use a nil value instead of -1, -1.  It won't correctly handle signed
+ integers which may have a valid value of -1.
+*/
+
 func prepareDumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength uint64, insertableCols string) {
 
 	if dataLength < FileTargetSize {
@@ -278,9 +280,7 @@ func prepareDumpTable(db *sql.DB, schema string, table string, primaryKey string
 			go dumpTableData(db, schema, table, primaryKey, insertableCols, start, end)
 
 		}
-
 	}
-
 }
 
 func dumpCreateTable(db *sql.DB, schema string, table string) {
@@ -369,7 +369,14 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 			if raw == nil {
 				result[i] = "NULL"
 			} else {
-				result[i] = fmt.Sprintf("'%s'", escape(string(raw))) // @todo: get smart about escaping the value for numerics.
+
+				/*
+				 TODO:
+				 Pass type information from column
+				 Get smarter about escaping types, particularly numeric
+				*/
+
+				result[i] = fmt.Sprintf("'%s'", escape(string(raw)))
 			}
 		}
 
@@ -378,10 +385,7 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 		if uint64(buffer.Len()+len(values)) > BulkInsertLimit {
 			buffer.WriteString(";\n")
 			n, err := buffer.WriteTo(f)
-	        atomic.AddInt64(&BytesDumped, n)
-
-
-			//			log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
+			atomic.AddInt64(&BytesDumped, n)
 			check(err)
 			buffer.Reset()
 		}
@@ -400,7 +404,7 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 	if buffer.Len() > 0 {
 		buffer.WriteString(";\n")
 		n, err := buffer.WriteTo(f)
-        atomic.AddInt64(&BytesDumped, n)
+		atomic.AddInt64(&BytesDumped, n)
 		check(err)
 		buffer.Reset()
 	}
@@ -454,7 +458,7 @@ func copyFileToS3(filename string, copyType string) {
 	if copyType != "schema" {
 		FilesCopyCompleted += 1
 		fi, _ := file.Stat()
-        atomic.AddInt64(&BytesCopied, fi.Size())
+		atomic.AddInt64(&BytesCopied, fi.Size())
 		TableCopyWg.Done()
 	} else {
 		SchemaCopyWg.Done()
