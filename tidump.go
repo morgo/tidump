@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
+    "sync"
 	log "github.com/sirupsen/logrus"
 	"math"
 	"os"
@@ -22,9 +23,7 @@ import (
  TODO:
  * Delete local files after copy to S3
  * Track bytes written locally, and subtract once deleted (write warning if space usage is high vs. threshold)
- * Add parallel execution
  * Add compression
- * Add progress reporting
  * Improve escaping function (don't quote integers!)
  * Add regular expression to match databases
 
@@ -36,14 +35,11 @@ LIMITATIONS:
 var StartTime = time.Now()
 var MySQLConnectionString, AwsS3Bucket, AwsS3BucketPrefix, AwsS3Region, TmpDir string
 var FileTargetSize, BulkInsertLimit, TmpDirMax uint64
+var FilesDumpCompleted, FilesCopyCompleted, TotalFiles int
 
-func getenv(key, fallback string) string {
-	value := os.Getenv(key)
-	if len(value) == 0 {
-		return fallback
-	}
-	return value
-}
+var TableDumpWg sync.WaitGroup
+var TableCopyWg sync.WaitGroup
+var SchemaCopyWg sync.WaitGroup
 
 func main() {
 
@@ -62,6 +58,8 @@ func main() {
 
 	configCheckAndSetTiDBSnapshot(db)
 
+	go publishStatus();
+
 	/*
 
 	 This query can be improved by adding more meta data to the server:
@@ -72,20 +70,22 @@ func main() {
 	*/
 
 	query := `SELECT
-	t.table_schema,
-	t.table_name,
-	if(AVG_ROW_LENGTH=0,100,AVG_ROW_LENGTH) as avg_row_length,
-	t.data_length,
-	IFNULL(pk.likely_primary_key,'_tidb_rowid'),
-	c.insertable
-FROM INFORMATION_SCHEMA.TABLES t
+ t.table_schema,
+ t.table_name,
+ if(AVG_ROW_LENGTH=0,100,AVG_ROW_LENGTH) as avg_row_length,
+ t.data_length,
+ IFNULL(pk.likely_primary_key,'_tidb_rowid'),
+ c.insertable
+FROM
+ INFORMATION_SCHEMA.TABLES t
 LEFT JOIN 
-(SELECT table_schema, table_name, column_name as likely_primary_key FROM information_schema.key_column_usage WHERE constraint_name='PRIMARY') pk
-ON t.table_schema = pk.table_schema AND t.table_name=pk.table_name
+ (SELECT table_schema, table_name, column_name as likely_primary_key FROM information_schema.key_column_usage WHERE constraint_name='PRIMARY') pk
+ ON t.table_schema = pk.table_schema AND t.table_name=pk.table_name
 LEFT JOIN 
-(SELECT table_schema, table_name, GROUP_CONCAT(COLUMN_NAME)as insertable FROM information_schema.COLUMNS WHERE extra NOT LIKE '%%GENERATED%%' GROUP BY table_schema, table_name) c
-ON t.table_schema = c.table_schema AND t.table_name=c.table_name
-WHERE t.TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA')`
+ (SELECT table_schema, table_name, GROUP_CONCAT(COLUMN_NAME)as insertable FROM information_schema.COLUMNS WHERE extra NOT LIKE '%%GENERATED%%' GROUP BY table_schema, table_name) c
+ ON t.table_schema = c.table_schema AND t.table_name=c.table_name
+WHERE
+ t.TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA')`
 
 	tables, err := db.Query(query)
 	log.Debug(query)
@@ -93,7 +93,6 @@ WHERE t.TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA'
 	if err != nil {
 		log.Fatal("Could not read tables from information_schema.  Check MYSQL_CONNECTION is configured correctly.")
 	}
-
 
 	for tables.Next() {
 
@@ -109,9 +108,20 @@ WHERE t.TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA'
 
 		primaryKey := discoverPrimaryKey(db, schema, table, likelyPrimaryKey)
 
-		dumpTable(db, schema, table, primaryKey, avgRowLength, dataLength, insertableColumns)
+		dumpCreateTable(db, schema, table)
+		queueDumpTable(db, schema, table, primaryKey, avgRowLength, dataLength, insertableColumns)
 
 	}
+
+	// There is no schema dump Wg, it happens syncronous.
+
+    TableDumpWg.Wait()
+	TableCopyWg.Wait()
+	SchemaCopyWg.Wait()
+
+	// One final status line.
+
+	log.Info(fmt.Sprintf("TotalFiles: %d, FilesDumpCompleted: %d, FilesCopyCompleted: %d", TotalFiles, FilesDumpCompleted, FilesCopyCompleted))
 
 	t := time.Now()
 	elapsed := t.Sub(StartTime)
@@ -121,6 +131,25 @@ WHERE t.TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA'
 	}).Info("Complete")
 
 	//	writeMetaDataFile(start, t);
+
+}
+
+func getenv(key, fallback string) string {
+	value := os.Getenv(key)
+	if len(value) == 0 {
+		return fallback
+	}
+	return value
+}
+
+func publishStatus() {
+
+	for {
+
+		log.Info(fmt.Sprintf("TotalFiles: %d, FilesDumpCompleted: %d, FilesCopyCompleted: %d", TotalFiles, FilesDumpCompleted, FilesCopyCompleted))
+	    time.Sleep(2 * time.Second)
+
+	}
 
 }
 
@@ -201,31 +230,32 @@ func discoverTableMinMax(db *sql.DB, schema string, table string, primaryKey str
 
 }
 
-func discoverRowsPerChunk(avgRowLength int, fileTargetSize uint64) int {
+func discoverRowsPerFile(avgRowLength int, fileTargetSize uint64) int {
 	return int(math.Abs(math.Floor(float64(fileTargetSize) / float64(avgRowLength))))
 }
 
-func dumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength uint64, insertableCols string) {
-
-	dumpCreateTable(db, schema, table)
+func queueDumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength uint64, insertableCols string) {
 
 	if dataLength < FileTargetSize {
-		dumpTableData(db, schema, table, primaryKey, insertableCols, -1, -1) // small table
+	    TableDumpWg.Add(1)
+		go dumpTableData(db, schema, table, primaryKey, insertableCols, -1, -1) // small table
+		TotalFiles += 1
 	} else {
 
 		/*
 		 We need to figure out based on the reported avgRowLength,
-		 how many rows per chunk.  We can then quer the max+min values,
+		 how many rows per file.  We can then quer the max+min values,
 		 and add some unncessary off by one handling.
 		*/
 
-		rowsPerChunk := discoverRowsPerChunk(avgRowLength, FileTargetSize)
+		rowsPerFile := discoverRowsPerFile(avgRowLength, FileTargetSize)
 		min, max := discoverTableMinMax(db, schema, table, primaryKey)
+		TotalFiles += int(math.Ceil(float64(max-min) / float64(rowsPerFile)))
 
-		for i := min; i < max; i += rowsPerChunk {
+		for i := min; i < max; i += rowsPerFile {
 
 			start := i
-			end := i + rowsPerChunk - 1
+			end := i + rowsPerFile - 1
 
 			if i == min {
 				start = -1
@@ -236,7 +266,8 @@ func dumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRo
 			}
 
 			log.Debug(fmt.Sprintf("Table: %s.%s.  Start: %d End: %d\n", schema, table, start, end))
-			dumpTableData(db, schema, table, primaryKey, insertableCols, start, end)
+		    TableDumpWg.Add(1)
+			go dumpTableData(db, schema, table, primaryKey, insertableCols, start, end)
 
 		}
 
@@ -264,11 +295,14 @@ func dumpCreateTable(db *sql.DB, schema string, table string) {
 	check(err)
 
 	f.Close()
-	copyFileToS3(file)
+	SchemaCopyWg.Add(1)
+	go copyFileToS3(file, "schema")
 
 }
 
 func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, insertableCols string, start int, end int) {
+
+    defer TableDumpWg.Done()
 
 	var buffer bytes.Buffer
 	var where, query string
@@ -360,7 +394,9 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 	}
 
 	f.Close()
-	copyFileToS3(file)
+	FilesDumpCompleted += 1
+	TableCopyWg.Add(1)
+	go copyFileToS3(file, "table")
 
 }
 
@@ -376,7 +412,7 @@ func quoteIdentifier(identifier string) string {
 	return fmt.Sprintf("`%s`", identifier)
 }
 
-func copyFileToS3(filename string) {
+func copyFileToS3(filename string, copyType string) {
 
 	file, err := os.Open(filename)
 	if err != nil {
@@ -402,6 +438,13 @@ func copyFileToS3(filename string) {
 	}
 
 	log.Debug(fmt.Sprintf("Successfully uploaded %s to %s\n", filename, result.Location))
+
+	if copyType != "schema" {
+		FilesCopyCompleted += 1
+		TableCopyWg.Done()
+	} else {
+		SchemaCopyWg.Done()
+	}
 
 }
 
