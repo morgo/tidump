@@ -40,6 +40,7 @@ var FilesDumpCompleted, FilesCopyCompleted, TotalFiles int
 var TableDumpWg sync.WaitGroup
 var TableCopyWg sync.WaitGroup
 var SchemaCopyWg sync.WaitGroup
+var SchemaDumpWg sync.WaitGroup
 
 func main() {
 
@@ -108,8 +109,10 @@ WHERE
 
 		primaryKey := discoverPrimaryKey(db, schema, table, likelyPrimaryKey)
 
-		dumpCreateTable(db, schema, table)
-		queueDumpTable(db, schema, table, primaryKey, avgRowLength, dataLength, insertableColumns)
+		go dumpCreateTable(db, schema, table)
+		SchemaDumpWg.Add(1)
+
+		prepareDumpTable(db, schema, table, primaryKey, avgRowLength, dataLength, insertableColumns)
 
 	}
 
@@ -117,6 +120,7 @@ WHERE
 
 	TableDumpWg.Wait()
 	TableCopyWg.Wait()
+	SchemaDumpWg.Wait()
 	SchemaCopyWg.Wait()
 
 	// One final status line.
@@ -234,7 +238,7 @@ func discoverRowsPerFile(avgRowLength int, fileTargetSize uint64) int {
 	return int(math.Abs(math.Floor(float64(fileTargetSize) / float64(avgRowLength))))
 }
 
-func queueDumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength uint64, insertableCols string) {
+func prepareDumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength uint64, insertableCols string) {
 
 	if dataLength < FileTargetSize {
 		TableDumpWg.Add(1)
@@ -276,6 +280,8 @@ func queueDumpTable(db *sql.DB, schema string, table string, primaryKey string, 
 }
 
 func dumpCreateTable(db *sql.DB, schema string, table string) {
+
+	defer SchemaDumpWg.Done()
 
 	var fakeTable string
 	var createTable string
