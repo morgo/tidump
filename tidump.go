@@ -21,25 +21,21 @@ import (
 /*
  TODO:
  * Delete local files after copy to S3
- * Add the bucketname and prefix as a configurable.
+ * Track bytes written locally, and subtract once deleted (write warning if space usage is high vs. threshold)
  * Add parallel execution
  * Add compression
  * Add progress reporting
  * Improve escaping function (don't quote integers!)
+ * Add regular expression to match databases
 
 LIMITATIONS:
 * Does not backup mysql system tables (plan to do GRANT syntax only)
-* Only backups up complete databases
 
 */
 
-const (
-	dumpdir = "dumpdir"
-)
-
 var StartTime = time.Now()
-var MySQLConnectionString, AwsS3Bucket, AwsS3BucketPrefix, AwsS3Region string
-var FileTargetSize, BulkInsertLimit uint64
+var MySQLConnectionString, AwsS3Bucket, AwsS3BucketPrefix, AwsS3Region, TmpDir string
+var FileTargetSize, BulkInsertLimit, TmpDirMax uint64
 
 func getenv(key, fallback string) string {
 	value := os.Getenv(key)
@@ -52,16 +48,7 @@ func getenv(key, fallback string) string {
 func main() {
 
 	MySQLConnectionString = getenv("TIDUMP_MYSQL_CONNECTION", "root@tcp(localhost:4000)/")
-	AwsS3Bucket = getenv("AWS_S3_BUCKET", "backups.tocker.ca")
-	AwsS3Region = getenv("AWS_S3_REGION", "us-east-1")
-	AwsS3BucketPrefix = getenv("AWS_S3_BUCKET_PREFIX", "blah")
-	FileTargetSize = 100 * 1024 // uint64(getenv("AWS_S3_FILE_TARGET_SIZE", string(100 * 1024))) // 100KiB
-	BulkInsertLimit = 1024      // uint64(getenv("BULK_INSERT_LIMIT", string(1024))) // 1KiB
-
 	db, err := sql.Open("mysql", MySQLConnectionString)
-
-	log.SetLevel(log.InfoLevel)
-	//	log.SetLevel(log.DebugLevel)
 
 	if err != nil {
 		log.Fatal("Could not connect to MySQL.  Please make sure you've set MYSQL_CONNECTION.")
@@ -73,10 +60,9 @@ func main() {
 	 In future this might be configurable.
 	*/
 
-	checkAndSetTiDB(db)
+	configCheckAndSetTiDBSnapshot(db)
 
 	/*
-	 @TODO: Add a Regex to filter the list of tables.
 
 	 This query can be improved by adding more meta data to the server:
 
@@ -108,7 +94,6 @@ WHERE t.TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA'
 		log.Fatal("Could not read tables from information_schema.  Check MYSQL_CONNECTION is configured correctly.")
 	}
 
-	os.Mkdir(dumpdir, 0700)
 
 	for tables.Next() {
 
@@ -145,7 +130,19 @@ func writeMetaDataFile(start time, finish time) {
 }
 */
 
-func checkAndSetTiDB(db *sql.DB) {
+func configCheckAndSetTiDBSnapshot(db *sql.DB) {
+
+	log.SetLevel(log.InfoLevel)
+	//	log.SetLevel(log.DebugLevel)
+
+	AwsS3Bucket = getenv("TIDUMP_AWS_S3_BUCKET", "backups.tocker.ca")
+	AwsS3Region = getenv("TIDUMP_AWS_S3_REGION", "us-east-1")
+	FileTargetSize = 100 * 1024                      // uint64(getenv("AWS_S3_FILE_TARGET_SIZE", string(100 * 1024))) // 100KiB
+	BulkInsertLimit = 1024                           // uint64(getenv("BULK_INSERT_LIMIT", string(1024))) // 1KiB
+	TmpDirMax = 5 * 1024 * 1024 * 1024               // 5 GiB
+	TmpDir = getenv("TIDUMP_TMPDIR", "/tmp/tidump/") // TODO: use mktemp
+
+	os.Mkdir(TmpDir, 0700)
 
 	/*
 	 Check that the minimum version is TiDB 2.1.
@@ -154,6 +151,9 @@ func checkAndSetTiDB(db *sql.DB) {
 	*/
 
 	db.Exec("SET group_concat_max_len = 1024 * 1024")
+
+	// TODO: get the hostname, and assign it to the S3 bucket prefix.
+	AwsS3BucketPrefix = getenv("AWS_S3_BUCKET_PREFIX", "blah")
 
 	query := "SET tidb_snapshot = NOW() - INTERVAL 1 SECOND"
 
@@ -250,7 +250,7 @@ func dumpCreateTable(db *sql.DB, schema string, table string) {
 	var createTable string
 
 	query := fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", schema, table)
-	file := fmt.Sprintf("dumpdir/%s.%s-schema.sql", schema, table)
+	file := fmt.Sprintf("%s%s.%s-schema.sql", TmpDir, schema, table)
 
 	err := db.QueryRow(query).Scan(&fakeTable, &createTable)
 	log.Debug(query)
@@ -291,7 +291,7 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 		query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` %s ", insertableCols, schema, table, where)
 	}
 
-	file := fmt.Sprintf("dumpdir/%s.%s%s.sql", schema, table, prefix)
+	file := fmt.Sprintf("%s%s.%s%s.sql", TmpDir, schema, table, prefix)
 
 	// ------------- Dump Data ------------------- //
 
