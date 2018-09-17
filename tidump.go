@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -21,8 +22,9 @@ import (
 
 /*
  TODO:
+ * Change the mysql connection to be a pool -> Make sure all members of the pool have the TIDB_SNAPSHOT set.
  * Delete local files after copy to S3
- * Track bytes written locally, and subtract once deleted (write warning if space usage is high vs. threshold)
+ * Pause dumps if local tmpsize exceeds threshold.
  * Add compression
  * Improve escaping function (don't quote integers!)
  * Add regular expression to match databases
@@ -35,12 +37,10 @@ LIMITATIONS:
 var StartTime = time.Now()
 var MySQLConnectionString, AwsS3Bucket, AwsS3BucketPrefix, AwsS3Region, TmpDir string
 var FileTargetSize, BulkInsertLimit, TmpDirMax uint64
+var BytesDumped, BytesCopied int64
 var FilesDumpCompleted, FilesCopyCompleted, TotalFiles int
 
-var TableDumpWg sync.WaitGroup
-var TableCopyWg sync.WaitGroup
-var SchemaCopyWg sync.WaitGroup
-var SchemaDumpWg sync.WaitGroup
+var TableDumpWg, TableCopyWg, SchemaCopyWg, SchemaDumpWg sync.WaitGroup
 
 func main() {
 
@@ -125,7 +125,7 @@ WHERE
 
 	// One final status line.
 
-	log.Info(fmt.Sprintf("TotalFiles: %d, FilesDumpCompleted: %d, FilesCopyCompleted: %d", TotalFiles, FilesDumpCompleted, FilesCopyCompleted))
+	status()
 
 	t := time.Now()
 	elapsed := t.Sub(StartTime)
@@ -146,13 +146,17 @@ func getenv(key, fallback string) string {
 	return value
 }
 
+func status() {
+	log.Info(fmt.Sprintf("TotalFiles: %d, FilesDumpCompleted: %d, FilesCopyCompleted: %d", TotalFiles, FilesDumpCompleted, FilesCopyCompleted))
+	log.Info(fmt.Sprintf("BytesDumped: %d, Copied (success): %d, TmpSize: %d", BytesDumped, BytesCopied, (BytesDumped-BytesCopied)))
+
+}
+
 func publishStatus() {
 
 	for {
-
-		log.Info(fmt.Sprintf("TotalFiles: %d, FilesDumpCompleted: %d, FilesCopyCompleted: %d", TotalFiles, FilesDumpCompleted, FilesCopyCompleted))
+		status()
 		time.Sleep(2 * time.Second)
-
 	}
 
 }
@@ -373,7 +377,9 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 
 		if uint64(buffer.Len()+len(values)) > BulkInsertLimit {
 			buffer.WriteString(";\n")
-			_, err := buffer.WriteTo(f)
+			n, err := buffer.WriteTo(f)
+	        atomic.AddInt64(&BytesDumped, n)
+
 
 			//			log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
 			check(err)
@@ -393,8 +399,8 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 
 	if buffer.Len() > 0 {
 		buffer.WriteString(";\n")
-		_, err := buffer.WriteTo(f)
-		//		log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
+		n, err := buffer.WriteTo(f)
+        atomic.AddInt64(&BytesDumped, n)
 		check(err)
 		buffer.Reset()
 	}
@@ -447,6 +453,8 @@ func copyFileToS3(filename string, copyType string) {
 
 	if copyType != "schema" {
 		FilesCopyCompleted += 1
+		fi, _ := file.Stat()
+        atomic.AddInt64(&BytesCopied, fi.Size())
 		TableCopyWg.Done()
 	} else {
 		SchemaCopyWg.Done()
