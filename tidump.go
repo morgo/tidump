@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
-    "sync"
 	log "github.com/sirupsen/logrus"
 	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -58,7 +58,7 @@ func main() {
 
 	configCheckAndSetTiDBSnapshot(db)
 
-	go publishStatus();
+	go publishStatus()
 
 	/*
 
@@ -115,7 +115,7 @@ WHERE
 
 	// There is no schema dump Wg, it happens syncronous.
 
-    TableDumpWg.Wait()
+	TableDumpWg.Wait()
 	TableCopyWg.Wait()
 	SchemaCopyWg.Wait()
 
@@ -147,7 +147,7 @@ func publishStatus() {
 	for {
 
 		log.Info(fmt.Sprintf("TotalFiles: %d, FilesDumpCompleted: %d, FilesCopyCompleted: %d", TotalFiles, FilesDumpCompleted, FilesCopyCompleted))
-	    time.Sleep(2 * time.Second)
+		time.Sleep(2 * time.Second)
 
 	}
 
@@ -237,7 +237,7 @@ func discoverRowsPerFile(avgRowLength int, fileTargetSize uint64) int {
 func queueDumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength uint64, insertableCols string) {
 
 	if dataLength < FileTargetSize {
-	    TableDumpWg.Add(1)
+		TableDumpWg.Add(1)
 		go dumpTableData(db, schema, table, primaryKey, insertableCols, -1, -1) // small table
 		TotalFiles += 1
 	} else {
@@ -266,7 +266,7 @@ func queueDumpTable(db *sql.DB, schema string, table string, primaryKey string, 
 			}
 
 			log.Debug(fmt.Sprintf("Table: %s.%s.  Start: %d End: %d\n", schema, table, start, end))
-		    TableDumpWg.Add(1)
+			TableDumpWg.Add(1)
 			go dumpTableData(db, schema, table, primaryKey, insertableCols, start, end)
 
 		}
@@ -302,7 +302,7 @@ func dumpCreateTable(db *sql.DB, schema string, table string) {
 
 func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, insertableCols string, start int, end int) {
 
-    defer TableDumpWg.Done()
+	defer TableDumpWg.Done()
 
 	var buffer bytes.Buffer
 	var where, query string
