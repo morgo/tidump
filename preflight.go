@@ -3,9 +3,10 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	log "github.com/sirupsen/logrus"
+	"github.com/ngaut/log"
 	"io/ioutil"
 	"os"
+	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -20,10 +21,11 @@ func getenv(key, fallback string) string {
 
 func preflightChecks(db *sql.DB) {
 
-	log.SetLevel(log.InfoLevel)
+	//	log.SetLevel(log.InfoLevel)
 
 	AwsS3Bucket = getenv("TIDUMP_AWS_S3_BUCKET", "backups.tocker.ca")
 	AwsS3Region = getenv("TIDUMP_AWS_S3_REGION", "us-east-1")
+	MySQLRegex = getenv("TIDUMP_MYSQL_REGEX", "")
 
 	/*
 	 These could be made configurable,
@@ -43,13 +45,17 @@ func preflightChecks(db *sql.DB) {
 	db.Exec("SET group_concat_max_len = 1024 * 1024")
 	var hostname string
 
-	query := "SELECT @@hostname, NOW()"
+	time.Sleep(time.Second) // finish this second first
+	query := "SELECT @@hostname, NOW()-INTERVAL 1 SECOND"
 	err := db.QueryRow(query).Scan(&hostname, &MySQLNow)
 	log.Debug(query)
-	check(err)
+
+	if err != nil {
+		log.Fatal("Could not get server time for tidb_snapsot")
+	}
 
 	AwsS3BucketPrefix = getenv("AWS_S3_BUCKET_PREFIX", fmt.Sprintf("tidump-%s/%s", hostname, StartTime.Format("2006-01-02")))
-	log.Info(fmt.Sprintf("Uploading to %s/%s", AwsS3Bucket, AwsS3BucketPrefix))
+	log.Infof("Uploading to %s/%s", AwsS3Bucket, AwsS3BucketPrefix)
 
 	/*
 	 Make a directory to write temporary dump files.
@@ -57,10 +63,10 @@ func preflightChecks(db *sql.DB) {
 	*/
 
 	TmpDir, err = ioutil.TempDir("", "tidump")
-	log.Info(fmt.Sprintf("Writing temporary files to: %s", TmpDir))
+	log.Infof("Writing temporary files to: %s", TmpDir)
 
 	if err != nil {
-		log.Fatal(fmt.Sprintf("Could not create tempdir: %s", err))
+		log.Fatalf("Could not create tempdir: %s", err)
 	}
 
 }

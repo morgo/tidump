@@ -1,12 +1,8 @@
 package main
 
 import (
-	"bytes"
-	"database/sql"
 	"fmt"
-	log "github.com/sirupsen/logrus"
-	"math"
-	"os"
+	"github.com/ngaut/log"
 	"strings"
 	"sync/atomic"
 
@@ -21,23 +17,24 @@ func Map(vs []string, f func(string) string) []string {
 	return vsm
 }
 
-func prepareDumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength int64, insertableCols string) {
+/*
+ This function chunk-splits the table into files based on the dataLength
+ and avgRowLength reported in information_schema.  In future, a region
+ based strategy will be used, so this function will likely change
+ quite a lot.
+*/
+
+func prepareDumpTable(schema string, table string, avgRowLength int, dataLength int64, primaryKey string, insertableCols string) {
 
 	if dataLength < FileTargetSize {
 		TableDumpWg.Add(1)
-		go dumpTableData(schema, table, primaryKey, insertableCols, 0, 0) // small table
+		d := createDumpFile(schema, table, primaryKey, insertableCols, 0, 0) // small table
+		go dumpTableData(d)
 		atomic.AddInt64(&TotalFiles, 1)
 	} else {
 
-		/*
-		 We need to figure out based on the reported avgRowLength,
-		 how many rows per file.  We can then quer the max+min values,
-		 and add some unncessary off by one handling.
-		*/
-
 		rowsPerFile := discoverRowsPerFile(avgRowLength, FileTargetSize)
-		min, max := discoverTableMinMax(db, schema, table, primaryKey)
-		atomic.AddInt64(&TotalFiles, int64(math.Ceil(float64(max-min)/float64(rowsPerFile))))
+		min, max := discoverTableMinMax(schema, table, primaryKey)
 
 		for i := min; i < max; i += rowsPerFile {
 
@@ -52,57 +49,29 @@ func prepareDumpTable(db *sql.DB, schema string, table string, primaryKey string
 				end = 0
 			}
 
-			log.Debug(fmt.Sprintf("Table: %s.%s.  Start: %d End: %d\n", schema, table, start, end))
+			log.Debugf("Table: %s.%s.  Start: %d End: %d\n", schema, table, start, end)
 			TableDumpWg.Add(1)
-			go dumpTableData(schema, table, primaryKey, insertableCols, start, end)
+			d := createDumpFile(schema, table, primaryKey, insertableCols, start, end)
+			go dumpTableData(d)
+			atomic.AddInt64(&TotalFiles, 1)
 
 		}
 	}
 }
 
-func dumpTableData(schema string, table string, primaryKey string, insertableCols string, start int, end int) {
+func dumpTableData(d DumpFile) {
 
 	defer TableDumpWg.Done()
 
-	/* Create a new MySQL connection for this thread */
-	db, err := sql.Open("mysql", MySQLConnectionString)
+	db := newDbConnection()
+	defer db.Close()
+
+	rows, err := db.Query(d.sql)
+	log.Debug(d.sql)
 
 	if err != nil {
-		log.Fatal("Could not create worker thread connection to MySQL.")
+		log.Fatal("Could not retrieve table data: %s", d.schema, d.table)
 	}
-
-	defer db.Close()
-	setTiDBSnapshot(db) // set worker thread to same place as master thread.
-
-	startSql := "1=1"
-	endSql := "1=1"
-
-	var query string
-
-	if start != 0 {
-		startSql = fmt.Sprintf("%s > %d", primaryKey, start)
-	}
-
-	if end != 0 {
-		endSql = fmt.Sprintf("%s < %d", primaryKey, end)
-	}
-
-	if primaryKey == "_tidb_rowid" {
-		query = fmt.Sprintf("SELECT %s, _tidb_rowid FROM `%s`.`%s` WHERE %s AND %s", insertableCols, schema, table, startSql, endSql)
-	} else {
-		query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE %s AND %s", insertableCols, schema, table, startSql, endSql)
-	}
-
-	file := fmt.Sprintf("%s/%s.%s.%d.sql", TmpDir, schema, table, start)
-
-	// ------------- Dump Data ------------------- //
-
-	rows, err := db.Query(query)
-	log.Debug(query)
-	check(err)
-
-	f, err := os.Create(file)
-	check(err)
 
 	cols, _ := rows.Columns()
 	types, _ := rows.ColumnTypes()
@@ -116,8 +85,6 @@ func dumpTableData(schema string, table string, primaryKey string, insertableCol
 	for i, _ := range rawResult {
 		dest[i] = &rawResult[i] // Put pointers to each string in the interface slice
 	}
-
-	var buffer bytes.Buffer
 
 	for rows.Next() {
 		err = rows.Scan(dest...)
@@ -137,49 +104,37 @@ func dumpTableData(schema string, table string, primaryKey string, insertableCol
 				if t == "BIGINT" || t == "INT" || t == "DECIMAL" || t == "FLOAT" {
 					result[i] = string(raw)
 				} else {
-					result[i] = fmt.Sprintf("'%s'", escape(string(raw)))
+					result[i] = fmt.Sprintf("'%s'", quoteString(string(raw)))
 				}
 			}
 		}
 
 		values := fmt.Sprintf("(%s)", strings.Join(result, ","))
 
-		if int64(buffer.Len()+len(values)) > BulkInsertLimit {
-			buffer.WriteString(";\n")
-
-			if canSafelyWriteToTmpdir(int64(buffer.Len())) {
-				n, err := buffer.WriteTo(f)
-				atomic.AddInt64(&BytesDumped, n)
-				check(err)
-				buffer.Reset()
-			}
+		if int64(d.bufferLen()+len(values)) > BulkInsertLimit {
+			d.write(";\n")
+			d.flush()
 		}
 
-		if buffer.Len() == 0 {
-			buffer.WriteString(fmt.Sprintf("INSERT INTO %s (%s) VALUES \n%s", table, colsstr, values))
+		if d.bufferLen() == 0 {
+			d.write(fmt.Sprintf("INSERT INTO %s (%s) VALUES \n%s", d.table, colsstr, values))
 		} else {
-			buffer.WriteString(",\n")
-			buffer.WriteString(values)
+			d.write(",\n")
+			d.write(values)
 		}
 
 	}
 
 	// Flush any remaining buffer
 
-	if buffer.Len() > 0 {
-		buffer.WriteString(";\n")
-
-		if canSafelyWriteToTmpdir(int64(buffer.Len())) {
-			n, err := buffer.WriteTo(f)
-			atomic.AddInt64(&BytesDumped, n)
-			check(err)
-			buffer.Reset()
-		}
+	if d.bufferLen() > 0 {
+		d.write(";\n")
+		d.flush()
 	}
 
-	f.Close()
+	d.close()
 	atomic.AddInt64(&FilesDumpCompleted, 1)
 	TableCopyWg.Add(1)
-	go copyFileToS3(file, "table")
+	go copyFileToS3(d.file, "table")
 
 }

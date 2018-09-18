@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
 	"fmt"
-	log "github.com/sirupsen/logrus"
+	"github.com/ngaut/log"
 	"os"
 	"runtime"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,10 +28,9 @@ func canSafelyWriteToTmpdir(nBytes int64) bool {
 		if nBytes > freeSpace {
 			runtime.Gosched()           // Give prority to other gorountines, this ones blocked.
 			time.Sleep(5 * time.Second) // Waiting on S3 copy.
-			// the status thread will warn no free space.
-			continue
+			continue                    // the status thread will warn low/no free space.
 		} else {
-			log.Debug(fmt.Sprintf("Free Space: %d, Requested: %d", freeSpace, nBytes))
+			log.Debugf("Free Space: %d, Requested: %d", freeSpace, nBytes)
 			break
 		}
 
@@ -39,4 +42,87 @@ func canSafelyWriteToTmpdir(nBytes int64) bool {
 
 func cleanupTmpDir() {
 	os.RemoveAll(TmpDir) // delete temporary directory
+}
+
+type DumpFile struct {
+	schema string
+	table  string
+	sql    string
+	file   string
+	fi     *os.File
+	gf     *gzip.Writer
+	fw     *bufio.Writer
+	buffer *bytes.Buffer
+}
+
+func createDumpFile(schema string, table string, primaryKey string, insertableCols string, start int64, end int64) (d DumpFile) {
+
+	d.schema = schema
+	d.table = table
+
+	startSql := "1=1"
+	endSql := "1=1"
+
+	if start != 0 {
+		startSql = fmt.Sprintf("%s > %d", primaryKey, start)
+	}
+
+	if end != 0 {
+		endSql = fmt.Sprintf("%s < %d", primaryKey, end)
+	}
+
+	d.sql = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE %s AND %s", insertableCols, schema, table, startSql, endSql)
+	d.file = fmt.Sprintf("%s/%s.%s.%d.sql.gz", TmpDir, schema, table, start)
+
+	var err error
+
+	d.fi, err = os.Create(d.file)
+
+	if err != nil {
+		log.Fatalf("Error in creating file: %s", d.file)
+	}
+
+	d.gf = gzip.NewWriter(d.fi)
+	d.fw = bufio.NewWriter(d.gf)
+	d.buffer = new(bytes.Buffer)
+
+	return
+
+}
+
+func (d DumpFile) close() {
+	d.fw.Flush()
+	// Close the gzip first.
+	d.gf.Close()
+	d.fi.Close()
+}
+
+func (d DumpFile) write(s string) (int, error) {
+
+	// TODO: Get the zlib buffer len?
+	return d.buffer.WriteString(s)
+	// TODO: return zlib new length - old length?
+
+}
+
+func (d DumpFile) bufferLen() int {
+	return d.buffer.Len()
+}
+
+func (d DumpFile) flush() {
+
+	uncompressedLen := int64(d.bufferLen())
+
+	if canSafelyWriteToTmpdir(uncompressedLen) {
+
+		n, err := d.buffer.WriteTo(d.fw)
+		atomic.AddInt64(&BytesDumped, n)
+
+		if err != nil {
+			log.Fatal("Could not write to gz file: %s", d.file)
+		}
+
+		d.buffer.Reset()
+	}
+
 }

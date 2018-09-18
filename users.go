@@ -17,7 +17,7 @@ import (
  https://github.com/pingcap/tidb/issues/7733
 */
 
-func dumpPermissions(db *sql.DB) bool {
+func dumpUsers(db *sql.DB) bool {
 
 	return true
 

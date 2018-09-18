@@ -6,7 +6,7 @@ import (
 	"math"
 
 	_ "github.com/go-sql-driver/mysql"
-	log "github.com/sirupsen/logrus"
+	"github.com/ngaut/log"
 )
 
 /*
@@ -32,24 +32,23 @@ func discoverPrimaryKey(db *sql.DB, schema string, table string, likelyPrimaryKe
 
 }
 
-func discoverTableMinMax(db *sql.DB, schema string, table string, primaryKey string) (min int, max int) {
+func discoverTableMinMax(schema string, table string, primaryKey string) (min int64, max int64) {
+
+	db := newDbConnection() // won't be required soon
+	defer db.Close()        // i_s should return min/max
 
 	query := fmt.Sprintf("SELECT MIN(%s) as min, MAX(%s) max FROM `%s`.`%s`", primaryKey, primaryKey, schema, table)
 	err := db.QueryRow(query).Scan(&min, &max)
 	log.Debug(query)
-	check(err)
+
+	if err != nil {
+		log.Fatalf("Could not determine min/max values for table: %s.%s", schema, table)
+	}
 
 	return
 
 }
 
-func discoverRowsPerFile(avgRowLength int, fileTargetSize int64) int {
-	return int(math.Abs(math.Floor(float64(fileTargetSize) / float64(avgRowLength))))
-}
-
-func check(e error) {
-	if e != nil {
-		log.Fatal(e)
-		panic(e)
-	}
+func discoverRowsPerFile(avgRowLength int, fileTargetSize int64) int64 {
+	return int64(math.Abs(math.Floor(float64(fileTargetSize) / float64(avgRowLength))))
 }

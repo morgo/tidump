@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	log "github.com/sirupsen/logrus"
+	"github.com/ngaut/log"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -16,7 +16,7 @@ func copyFileToS3(filename string, copyType string) {
 
 	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatal(fmt.Sprintf("Could not open file for upload", filename))
+		log.Fatalf("Could not open file for upload: %s", filename)
 	}
 	defer file.Close()
 
@@ -32,11 +32,10 @@ func copyFileToS3(filename string, copyType string) {
 		Body:   file,
 	})
 	if err != nil {
-		fmt.Println("error", err)
-		os.Exit(1)
+		log.Fatalf("S3 write error: %s", err)
 	}
 
-	log.Debug(fmt.Sprintf("Successfully uploaded %s to %s\n", filename, result.Location))
+	log.Debugf("Successfully uploaded %s to %s\n", filename, result.Location)
 
 	os.Remove(filename) // Still open, it will free space on close
 

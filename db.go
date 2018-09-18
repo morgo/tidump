@@ -3,22 +3,33 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	log "github.com/sirupsen/logrus"
-	"time"
+	"github.com/ngaut/log"
 
 	_ "github.com/go-sql-driver/mysql"
 )
 
+func newDbConnection() *sql.DB {
+
+	/* Create a new MySQL connection for this thread */
+	db, err := sql.Open("mysql", MySQLConnectionString)
+
+	if err != nil {
+		log.Fatal("Could not create new connection to MySQL.")
+	}
+
+	setTiDBSnapshot(db) // set worker thread to same place as master thread.
+	return db
+
+}
+
 /*
- Set the tidb_snapshot to NOW()-INTERVAL 1 SECOND.
- before doing anything else.
+ Set the tidb_snapshot before doing anything else.
  In future this might be configurable.
 */
 
 func setTiDBSnapshot(db *sql.DB) {
 
 	query := fmt.Sprintf("SET tidb_snapshot = '%s'", MySQLNow)
-	time.Sleep(time.Second) // finish this second first
 	_, err := db.Exec(query)
 	log.Debug(query)
 
@@ -34,9 +45,9 @@ func setTiDBSnapshot(db *sql.DB) {
  https://github.com/pingcap/tidb/issues/7714
 */
 
-func findAllTables() string {
+func findAllTables(regex string) (sql string) {
 
-	return `SELECT
+	sql = `SELECT
  t.table_schema,
  t.table_name,
  if(AVG_ROW_LENGTH=0,100,AVG_ROW_LENGTH) as avg_row_length,
@@ -54,4 +65,63 @@ LEFT JOIN
 WHERE
  t.TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA')`
 
+	if len(regex) > 0 {
+		sql = fmt.Sprintf("%s AND concat(t.table_schema, '.', t.table_name) RLIKE '%s'", sql, regex)
+	}
+
+	return
+
+}
+
+func quoteIdentifier(identifier string) string {
+	return fmt.Sprintf("`%s`", identifier)
+}
+
+func quoteString(source string) string {
+	var j int = 0
+	if len(source) == 0 {
+		return ""
+	}
+	tempStr := source[:]
+	desc := make([]byte, len(tempStr)*2)
+	for i := 0; i < len(tempStr); i++ {
+		flag := false
+		var escape byte
+		switch tempStr[i] {
+		case '\r':
+			flag = true
+			escape = '\r'
+			break
+		case '\n':
+			flag = true
+			escape = '\n'
+			break
+		case '\\':
+			flag = true
+			escape = '\\'
+			break
+		case '\'':
+			flag = true
+			escape = '\''
+			break
+		case '"':
+			flag = true
+			escape = '"'
+			break
+		case '\032':
+			flag = true
+			escape = 'Z'
+			break
+		default:
+		}
+		if flag {
+			desc[j] = '\\'
+			desc[j+1] = escape
+			j = j + 2
+		} else {
+			desc[j] = tempStr[i]
+			j = j + 1
+		}
+	}
+	return string(desc[0:j])
 }

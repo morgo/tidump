@@ -2,23 +2,20 @@ package main
 
 import (
 	"database/sql"
+	"fmt"
 	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	log "github.com/sirupsen/logrus"
+	"github.com/ngaut/log"
 )
 
 /*
  TODO:
- * Switch to ngaut/log
+ * Add configuration system / help command.
+ * There is a bug in counting local dump bytes.  It should be compressed size.
+ * Fix races with a read write lock.
  * Change the mysql connection to be a pool (currently workers use their own connection, and goroutines could overload source.)
- * Design structs to hold backup
- * Fix races
-
-ROADMAP/FEATURE IDEAS:
-* Compress files before uploading to S3
-* Add regular expression to match databases
 
 LIMITATIONS:
 * Does not backup users.  Waiting on TIDB #7733.
@@ -29,7 +26,7 @@ LIMITATIONS:
 */
 
 var StartTime = time.Now()
-var MySQLConnectionString, MySQLNow, AwsS3Bucket, AwsS3BucketPrefix, AwsS3Region, TmpDir string
+var MySQLConnectionString, MySQLNow, MySQLRegex, AwsS3Bucket, AwsS3BucketPrefix, AwsS3Region, TmpDir string
 var FileTargetSize, BulkInsertLimit, BytesDumped, BytesCopied, TmpDirMax int64
 var FilesDumpCompleted, FilesCopyCompleted, TotalFiles int64
 
@@ -47,43 +44,44 @@ func main() {
 	preflightChecks(db)
 	setTiDBSnapshot(db)
 
-	go publishStatus() // every 2 seconds
+	go publishStatus() // every few seconds
 
-	query := findAllTables()
+	dumpUsers(db) // currently does nothing
+
+	query := findAllTables(MySQLRegex)
 	tables, err := db.Query(query)
 	log.Debug(query)
 
 	if err != nil {
-		log.Fatal("Could not read tables from information_schema.  Check MYSQL_CONNECTION is configured correctly.")
+		log.Fatal("Check MYSQL_CONNECTION is configured correctly.")
 	}
 
 	for tables.Next() {
 
-		var schema string
-		var table string
+		var schema, table, likelyPrimaryKey, insertableColumns string
 		var avgRowLength int
 		var dataLength int64
-		var likelyPrimaryKey string
-		var insertableColumns string
 
 		err = tables.Scan(&schema, &table, &avgRowLength, &dataLength, &likelyPrimaryKey, &insertableColumns)
-		check(err)
+		if err != nil {
+			log.Fatal("Check MYSQL_CONNECTION is configured correctly.")
+		}
 
 		primaryKey := discoverPrimaryKey(db, schema, table, likelyPrimaryKey)
 
-		go dumpCreateTable(db, schema, table)
-		SchemaDumpWg.Add(1)
+		if primaryKey == "_tidb_rowid" {
+			insertableColumns = fmt.Sprintf("%s,%s", insertableColumns, primaryKey)
+		}
 
-		prepareDumpTable(db, schema, table, primaryKey, avgRowLength, dataLength, insertableColumns)
+		prepareDumpSchema(schema, table)
+		prepareDumpTable(schema, table, avgRowLength, dataLength, primaryKey, insertableColumns)
 
 	}
-
-	dumpPermissions(db) // does nothing
 
 	/*
 	 The work is handled in goroutines.
 	 The dump routines write to the tmpdir, and then
-	 trigger a gorouting for copying to S3.
+	 trigger a goroutine for copying to S3.
 	*/
 
 	TableDumpWg.Wait()
@@ -95,12 +93,6 @@ func main() {
 	status() // print status before exiting
 
 	t := time.Now()
-	elapsed := t.Sub(StartTime)
-
-	log.WithFields(log.Fields{
-		"StartTime":  StartTime,
-		"FinishTime": t,
-		"elapsed":    elapsed,
-	}).Info("Complete")
+	log.Infof("Completed in %s seconds.", t.Sub(StartTime))
 
 }
