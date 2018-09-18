@@ -5,8 +5,8 @@ import (
 	"sync"
 	"time"
 
-	log "github.com/sirupsen/logrus"
 	_ "github.com/go-sql-driver/mysql"
+	log "github.com/sirupsen/logrus"
 )
 
 /*
@@ -124,7 +124,7 @@ WHERE
 	SchemaCopyWg.Wait()
 
 	cleanupTmpDir()
-	status()             // print status before exiting
+	status() // print status before exiting
 
 	t := time.Now()
 	elapsed := t.Sub(StartTime)
@@ -137,8 +137,6 @@ WHERE
 
 }
 
-
-
 func Map(vs []string, f func(string) string) []string {
 	vsm := make([]string, len(vs))
 	for i, v := range vs {
@@ -146,7 +144,6 @@ func Map(vs []string, f func(string) string) []string {
 	}
 	return vsm
 }
-
 
 func check(e error) {
 	if e != nil {

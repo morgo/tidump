@@ -32,7 +32,6 @@ func setTiDBSnapshot(db *sql.DB) {
 
 }
 
-
 func preflightChecks(db *sql.DB) {
 
 	log.SetLevel(log.InfoLevel)
@@ -79,4 +78,3 @@ func preflightChecks(db *sql.DB) {
 	}
 
 }
-

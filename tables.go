@@ -1,17 +1,16 @@
 package main
 
 import (
-	"fmt"
-	"math"
-	"sync/atomic"
-	log "github.com/sirupsen/logrus"
-	"strings"
 	"bytes"
-	"os"
 	"database/sql"
+	"fmt"
+	log "github.com/sirupsen/logrus"
+	"math"
+	"os"
+	"strings"
+	"sync/atomic"
 
 	_ "github.com/go-sql-driver/mysql"
-
 )
 
 func prepareDumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength int64, insertableCols string) {

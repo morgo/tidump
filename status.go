@@ -2,9 +2,8 @@ package main
 
 import (
 	"fmt"
-	"time"
 	log "github.com/sirupsen/logrus"
-
+	"time"
 )
 
 func status() {
@@ -28,4 +27,3 @@ func publishStatus() {
 	}
 
 }
-

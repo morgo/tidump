@@ -3,10 +3,9 @@ package main
 import (
 	"fmt"
 	log "github.com/sirupsen/logrus"
-	"time"
-	"runtime"
 	"os"
-
+	"runtime"
+	"time"
 )
 
 /*

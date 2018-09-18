@@ -1,15 +1,14 @@
 package main
 
 import (
- "database/sql"
- "fmt"
- "sync/atomic"
- "os"
+	"database/sql"
+	"fmt"
+	"os"
+	"sync/atomic"
 
-	log "github.com/sirupsen/logrus"
 	_ "github.com/go-sql-driver/mysql"
+	log "github.com/sirupsen/logrus"
 )
-
 
 func dumpCreateTable(db *sql.DB, schema string, table string) {
 

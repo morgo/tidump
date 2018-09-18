@@ -12,7 +12,6 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 )
 
-
 func copyFileToS3(filename string, copyType string) {
 
 	file, err := os.Open(filename)

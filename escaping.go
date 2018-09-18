@@ -1,13 +1,12 @@
 package main
 
 import (
- "fmt"
+	"fmt"
 )
 
 func quoteIdentifier(identifier string) string {
 	return fmt.Sprintf("`%s`", identifier)
 }
-
 
 func escape(source string) string {
 	var j int = 0

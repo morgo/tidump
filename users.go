@@ -4,9 +4,7 @@ import (
 	"database/sql"
 
 	_ "github.com/go-sql-driver/mysql"
-
 )
-
 
 /*
  I am waiting for the server to support SHOW CREATE USER,
@@ -24,4 +22,3 @@ func dumpPermissions(db *sql.DB) bool {
 	return true
 
 }
-

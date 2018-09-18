@@ -2,11 +2,11 @@ package main
 
 import (
 	"database/sql"
-	"math"
 	"fmt"
+	"math"
 
-	log "github.com/sirupsen/logrus"
 	_ "github.com/go-sql-driver/mysql"
+	log "github.com/sirupsen/logrus"
 )
 
 /*
@@ -46,4 +46,3 @@ func discoverTableMinMax(db *sql.DB, schema string, table string, primaryKey str
 func discoverRowsPerFile(avgRowLength int, fileTargetSize int64) int {
 	return int(math.Abs(math.Floor(float64(fileTargetSize) / float64(avgRowLength))))
 }
-
