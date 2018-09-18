@@ -44,7 +44,7 @@ func cleanupTmpDir() {
 	os.RemoveAll(TmpDir) // delete temporary directory
 }
 
-type DumpFile struct {
+type dumpFile struct {
 	schema string
 	table  string
 	sql    string
@@ -55,7 +55,7 @@ type DumpFile struct {
 	buffer *bytes.Buffer
 }
 
-func createDumpFile(schema string, table string, primaryKey string, insertableCols string, start int64, end int64) (d DumpFile) {
+func createDumpFile(schema string, table string, primaryKey string, insertableCols string, start int64, end int64) (d dumpFile) {
 
 	d.schema = schema
 	d.table = table
@@ -90,14 +90,14 @@ func createDumpFile(schema string, table string, primaryKey string, insertableCo
 
 }
 
-func (d DumpFile) close() {
+func (d dumpFile) close() {
 	d.fw.Flush()
 	// Close the gzip first.
 	d.gf.Close()
 	d.fi.Close()
 }
 
-func (d DumpFile) write(s string) (int, error) {
+func (d dumpFile) write(s string) (int, error) {
 
 	// TODO: Get the zlib buffer len?
 	return d.buffer.WriteString(s)
@@ -105,11 +105,11 @@ func (d DumpFile) write(s string) (int, error) {
 
 }
 
-func (d DumpFile) bufferLen() int {
+func (d dumpFile) bufferLen() int {
 	return d.buffer.Len()
 }
 
-func (d DumpFile) flush() {
+func (d dumpFile) flush() {
 
 	uncompressedLen := int64(d.bufferLen())
 

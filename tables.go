@@ -59,7 +59,7 @@ func prepareDumpTable(schema string, table string, avgRowLength int, dataLength 
 	}
 }
 
-func dumpTableData(d DumpFile) {
+func dumpTableData(d dumpFile) {
 
 	defer TableDumpWg.Done()
 

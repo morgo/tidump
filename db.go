@@ -78,7 +78,7 @@ func quoteIdentifier(identifier string) string {
 }
 
 func quoteString(source string) string {
-	var j int = 0
+	var j int
 	if len(source) == 0 {
 		return ""
 	}
