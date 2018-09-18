@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"fmt"
 	log "github.com/sirupsen/logrus"
+	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,24 +24,25 @@ import (
 
 /*
  TODO:
- * Change the mysql connection to be a pool -> Make sure all members of the pool have the TIDB_SNAPSHOT set.
- * Delete local files after copy to S3
- * Pause dumps if local tmpsize exceeds threshold.
- * Add compression
- * Improve escaping function (don't quote integers!)
- * Add regular expression to match databases
+ * Change the mysql connection to be a pool (currently workers use their own connection, and goroutines could overload source.)
  * Design structs to hold backup
 
-LIMITATIONS:
-* Does not backup mysql system tables (plan to do GRANT syntax only)
+ROADMAP/FEATURE IDEAS:
+* Compress files before uploading to S3
+* Add regular expression to match databases
 
+LIMITATIONS:
+* Does not backup users.  Waiting on TIDB #7733.
+* Not efficient at finding Primary Key.  Waiting on TiDB #7714.
+* Does not do reads as low priority.  Prefer to use TiDB #7524
+* Files may not be equal in size (may be fixed in TiDB #7714)
+* Server does not expose version in easily parsable format (Need to File)
 */
 
 var StartTime = time.Now()
-var MySQLConnectionString, AwsS3Bucket, AwsS3BucketPrefix, AwsS3Region, TmpDir string
-var FileTargetSize, BulkInsertLimit, TmpDirMax uint64
-var BytesDumped, BytesCopied int64
-var FilesDumpCompleted, FilesCopyCompleted, TotalFiles int
+var MySQLConnectionString, MySQLNow, AwsS3Bucket, AwsS3BucketPrefix, AwsS3Region, TmpDir string
+var FileTargetSize, BulkInsertLimit, BytesDumped, BytesCopied, TmpDirMax int64
+var FilesDumpCompleted, FilesCopyCompleted, TotalFiles int64
 
 var TableDumpWg, TableCopyWg, SchemaCopyWg, SchemaDumpWg sync.WaitGroup
 
@@ -58,7 +61,8 @@ func main() {
 	 In future this might be configurable.
 	*/
 
-	configCheckAndSetTiDBSnapshot(db)
+	preflightChecks(db)
+	setTiDBSnapshot(db)
 
 	go publishStatus() // every 2 seconds
 
@@ -81,10 +85,10 @@ func main() {
 FROM
  INFORMATION_SCHEMA.TABLES t
 LEFT JOIN 
- (SELECT table_schema, table_name, column_name as likely_primary_key FROM information_schema.key_column_usage WHERE constraint_name='PRIMARY') pk
+ (SELECT table_schema, table_name, column_name as likely_primary_key FROM information_schema.key_column_usage WHERE constraint_name='PRIMARY' AND TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA') ) pk
  ON t.table_schema = pk.table_schema AND t.table_name=pk.table_name
 LEFT JOIN 
- (SELECT table_schema, table_name, GROUP_CONCAT(COLUMN_NAME)as insertable FROM information_schema.COLUMNS WHERE extra NOT LIKE '%%GENERATED%%' GROUP BY table_schema, table_name) c
+ (SELECT table_schema, table_name, GROUP_CONCAT(COLUMN_NAME)as insertable FROM information_schema.COLUMNS WHERE extra NOT LIKE '%%GENERATED%%' AND TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA') GROUP BY table_schema, table_name) c
  ON t.table_schema = c.table_schema AND t.table_name=c.table_name
 WHERE
  t.TABLE_SCHEMA NOT IN ('mysql', 'INFORMATION_SCHEMA', 'PERFORMANCE_SCHEMA')`
@@ -101,7 +105,7 @@ WHERE
 		var schema string
 		var table string
 		var avgRowLength int
-		var dataLength uint64
+		var dataLength int64
 		var likelyPrimaryKey string
 		var insertableColumns string
 
@@ -117,6 +121,8 @@ WHERE
 
 	}
 
+	dumpPermissions(db) // does nothing
+
 	/*
 	 The work is handled in goroutines.
 	 The dump routines write to the tmpdir, and then
@@ -128,7 +134,8 @@ WHERE
 	SchemaDumpWg.Wait()
 	SchemaCopyWg.Wait()
 
-	status() // print status before exiting
+	os.RemoveAll(TmpDir) // delete temporary directory
+	status()             // print status before exiting
 
 	t := time.Now()
 	elapsed := t.Sub(StartTime)
@@ -150,8 +157,15 @@ func getenv(key, fallback string) string {
 }
 
 func status() {
+
+	freeSpace := TmpDirMax - (BytesDumped - BytesCopied)
+
 	log.Info(fmt.Sprintf("TotalFiles: %d, FilesDumpCompleted: %d, FilesCopyCompleted: %d", TotalFiles, FilesDumpCompleted, FilesCopyCompleted))
 	log.Info(fmt.Sprintf("BytesDumped: %d, Copied (success): %d, TmpSize: %d", BytesDumped, BytesCopied, (BytesDumped - BytesCopied)))
+
+	if freeSpace <= FileTargetSize {
+		log.Warning(fmt.Sprintf("Low free space: %d bytes", freeSpace))
+	}
 
 }
 
@@ -164,33 +178,57 @@ func publishStatus() {
 
 }
 
-func configCheckAndSetTiDBSnapshot(db *sql.DB) {
+func preflightChecks(db *sql.DB) {
 
 	log.SetLevel(log.InfoLevel)
-	//	log.SetLevel(log.DebugLevel)
 
 	AwsS3Bucket = getenv("TIDUMP_AWS_S3_BUCKET", "backups.tocker.ca")
 	AwsS3Region = getenv("TIDUMP_AWS_S3_REGION", "us-east-1")
-	FileTargetSize = 100 * 1024                      // TODO: uint64(getenv("AWS_S3_FILE_TARGET_SIZE", string(100 * 1024))) // 100KiB
-	BulkInsertLimit = 1024                           // TODO: uint64(getenv("BULK_INSERT_LIMIT", string(1024))) // 1KiB
-	TmpDirMax = 5 * 1024 * 1024 * 1024               // TODO: 5 GiB
-	TmpDir = getenv("TIDUMP_TMPDIR", "/tmp/tidump/") // TODO: use mktemp
-
-	os.Mkdir(TmpDir, 0700)
 
 	/*
-	 TODO: Check that the minimum version is TiDB 2.1.
-	 information_schema.tables was not accurate
-	 until RC2.
+	 These could be made configurable,
+	 but it's not known if there is a strong
+	 use case to do so.
 	*/
 
+	FileTargetSize = 100 * 1024 * 1024 // 100MiB, same as a region
+	BulkInsertLimit = 16 * 1024 * 1024 // 16MiB, less than max_allowed_packet
+	TmpDirMax = 5 * 1024 * 1024 * 1024 // 5GiB, assume small AMI local disk
+
+	if TmpDirMax < FileTargetSize*40 {
+		log.Warning("It is recommended to set a TmpDirMax 40x the size of FileTargetSize")
+		log.Warning("The tmpdir could block on all incomplete files.")
+	}
+
 	db.Exec("SET group_concat_max_len = 1024 * 1024")
+	var hostname string
 
-	// TODO: get the hostname, and assign it to the S3 bucket prefix.
-	AwsS3BucketPrefix = getenv("AWS_S3_BUCKET_PREFIX", "blah")
+	query := "SELECT @@hostname, NOW()"
+	err := db.QueryRow(query).Scan(&hostname, &MySQLNow)
+	log.Debug(query)
+	check(err)
 
-	query := "SET tidb_snapshot = NOW() - INTERVAL 1 SECOND"
+	AwsS3BucketPrefix = getenv("AWS_S3_BUCKET_PREFIX", fmt.Sprintf("tidump-%s/%s", hostname, StartTime.Format("2006-01-02")))
+	log.Info(fmt.Sprintf("Uploading to %s/%s", AwsS3Bucket, AwsS3BucketPrefix))
 
+	/*
+	 Make a directory to write temporary dump files.
+	 it will fill up to TmpDirMax (5GiB)
+	*/
+
+	TmpDir, err = ioutil.TempDir("", "tidump")
+	log.Info(fmt.Sprintf("Writing temporary files to: %s", TmpDir))
+
+	if err != nil {
+		log.Fatal(fmt.Sprintf("Could not create tempdir: %s", err))
+	}
+
+}
+
+func setTiDBSnapshot(db *sql.DB) {
+
+	query := fmt.Sprintf("SET tidb_snapshot = '%s'", MySQLNow)
+	time.Sleep(time.Second) // finish this second first
 	_, err := db.Exec(query)
 	log.Debug(query)
 
@@ -209,7 +247,6 @@ func configCheckAndSetTiDBSnapshot(db *sql.DB) {
 
 func discoverPrimaryKey(db *sql.DB, schema string, table string, likelyPrimaryKey string) (columnName string) {
 
-	// Guess the primary key of the table.
 	query := fmt.Sprintf("SELECT _tidb_rowid FROM %s.%s LIMIT 1", schema, table)
 	_, err := db.Query(query)
 	log.Debug(query)
@@ -220,7 +257,7 @@ func discoverPrimaryKey(db *sql.DB, schema string, table string, likelyPrimaryKe
 		columnName = "_tidb_rowid"
 	}
 
-	return columnName
+	return
 
 }
 
@@ -235,21 +272,16 @@ func discoverTableMinMax(db *sql.DB, schema string, table string, primaryKey str
 
 }
 
-func discoverRowsPerFile(avgRowLength int, fileTargetSize uint64) int {
+func discoverRowsPerFile(avgRowLength int, fileTargetSize int64) int {
 	return int(math.Abs(math.Floor(float64(fileTargetSize) / float64(avgRowLength))))
 }
 
-/*
- TODO: use a nil value instead of -1, -1.  It won't correctly handle signed
- integers which may have a valid value of -1.
-*/
-
-func prepareDumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength uint64, insertableCols string) {
+func prepareDumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength int64, insertableCols string) {
 
 	if dataLength < FileTargetSize {
 		TableDumpWg.Add(1)
-		go dumpTableData(db, schema, table, primaryKey, insertableCols, -1, -1) // small table
-		TotalFiles += 1
+		go dumpTableData(schema, table, primaryKey, insertableCols, 0, 0) // small table
+		atomic.AddInt64(&TotalFiles, 1)
 	} else {
 
 		/*
@@ -260,7 +292,7 @@ func prepareDumpTable(db *sql.DB, schema string, table string, primaryKey string
 
 		rowsPerFile := discoverRowsPerFile(avgRowLength, FileTargetSize)
 		min, max := discoverTableMinMax(db, schema, table, primaryKey)
-		TotalFiles += int(math.Ceil(float64(max-min) / float64(rowsPerFile)))
+		atomic.AddInt64(&TotalFiles, int64(math.Ceil(float64(max-min)/float64(rowsPerFile))))
 
 		for i := min; i < max; i += rowsPerFile {
 
@@ -268,16 +300,16 @@ func prepareDumpTable(db *sql.DB, schema string, table string, primaryKey string
 			end := i + rowsPerFile - 1
 
 			if i == min {
-				start = -1
+				start = 0
 			}
 
 			if end > max {
-				end = -1
+				end = 0
 			}
 
 			log.Debug(fmt.Sprintf("Table: %s.%s.  Start: %d End: %d\n", schema, table, start, end))
 			TableDumpWg.Add(1)
-			go dumpTableData(db, schema, table, primaryKey, insertableCols, start, end)
+			go dumpTableData(schema, table, primaryKey, insertableCols, start, end)
 
 		}
 	}
@@ -287,55 +319,91 @@ func dumpCreateTable(db *sql.DB, schema string, table string) {
 
 	defer SchemaDumpWg.Done()
 
+	atomic.AddInt64(&TotalFiles, 1)
+
 	var fakeTable string
 	var createTable string
 
 	query := fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", schema, table)
-	file := fmt.Sprintf("%s%s.%s-schema.sql", TmpDir, schema, table)
+	file := fmt.Sprintf("%s/%s.%s-schema.sql", TmpDir, schema, table)
 
 	err := db.QueryRow(query).Scan(&fakeTable, &createTable)
 	log.Debug(query)
 	check(err)
 
-	f, err := os.Create(file)
-	check(err)
+	createTable = fmt.Sprintf("%s;\n", createTable)
 
-	_, err = f.WriteString(fmt.Sprintf("%s;\n", createTable))
-	//	log.Debug(fmt.Sprintf("wrote %d bytes\n", n))
-	check(err)
+	if canSafelyWriteToTmpdir(int64(len(createTable))) {
 
-	f.Close()
-	SchemaCopyWg.Add(1)
-	go copyFileToS3(file, "schema")
+		f, err := os.Create(file)
+		log.Debug(fmt.Sprintf("Creating file %s", file))
+		check(err)
+
+		n, err := f.WriteString(createTable)
+		check(err)
+
+		atomic.AddInt64(&BytesDumped, int64(n))
+
+		f.Close()
+		SchemaCopyWg.Add(1)
+		atomic.AddInt64(&FilesDumpCompleted, 1)
+		go copyFileToS3(file, "schema")
+
+	}
 
 }
 
-func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, insertableCols string, start int, end int) {
+/*
+ I am waiting for the server to support SHOW CREATE USER,
+ so semantically this can be:
+ SELECT user,host FROM mysql.user;
+ SHOW CREATE USER user.host;
+ SHOW GRANTS FOR user.host;
+
+ Support SHOW CREATE USER as in MySQL 5.7
+ https://github.com/pingcap/tidb/issues/7733
+*/
+
+func dumpPermissions(db *sql.DB) bool {
+
+	return true
+
+}
+
+func dumpTableData(schema string, table string, primaryKey string, insertableCols string, start int, end int) {
 
 	defer TableDumpWg.Done()
 
-	var buffer bytes.Buffer
-	var where, query string
-	var prefix = ""
+	/* Create a new MySQL connection for this thread */
+	db, err := sql.Open("mysql", MySQLConnectionString)
 
-	if start == -1 && end != -1 {
-		where = fmt.Sprintf("WHERE %s < %d", primaryKey, end)
-		prefix = fmt.Sprintf(".%d", 0)
-	} else if start != -1 && end != -1 {
-		where = fmt.Sprintf("WHERE %s BETWEEN %d AND %d", primaryKey, start, end)
-		prefix = fmt.Sprintf(".%d", start)
-	} else if start != -1 && end == -1 {
-		where = fmt.Sprintf("WHERE %s > %d", primaryKey, start)
-		prefix = fmt.Sprintf(".%d", start)
+	if err != nil {
+		log.Fatal("Could not create worker thread connection to MySQL.")
+	}
+
+	defer db.Close()
+	setTiDBSnapshot(db) // set worker thread to same place as master thread.
+
+	startSql := "1=1"
+	endSql := "1=1"
+
+	var query string
+
+	if start != 0 {
+		startSql = fmt.Sprintf("%s > %d", primaryKey, start)
+	}
+
+	if end != 0 {
+		endSql = fmt.Sprintf("%s < %d", primaryKey, end)
 	}
 
 	if primaryKey == "_tidb_rowid" {
-		query = fmt.Sprintf("SELECT %s, _tidb_rowid FROM `%s`.`%s` %s ", insertableCols, schema, table, where)
+		query = fmt.Sprintf("SELECT %s, _tidb_rowid FROM `%s`.`%s` WHERE %s AND %s", insertableCols, schema, table, startSql, endSql)
 	} else {
-		query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` %s ", insertableCols, schema, table, where)
+		query = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE %s AND %s", insertableCols, schema, table, startSql, endSql)
 	}
 
-	file := fmt.Sprintf("%s%s.%s%s.sql", TmpDir, schema, table, prefix)
+	file := fmt.Sprintf("%s/%s.%s.%d.sql", TmpDir, schema, table, start)
 
 	// ------------- Dump Data ------------------- //
 
@@ -346,7 +414,8 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 	f, err := os.Create(file)
 	check(err)
 
-	cols, err := rows.Columns()
+	cols, _ := rows.Columns()
+	types, _ := rows.ColumnTypes()
 	colsstr := strings.Join(Map(cols, quoteIdentifier), ",")
 
 	// Result is your slice string.
@@ -357,6 +426,8 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 	for i, _ := range rawResult {
 		dest[i] = &rawResult[i] // Put pointers to each string in the interface slice
 	}
+
+	var buffer bytes.Buffer
 
 	for rows.Next() {
 		err = rows.Scan(dest...)
@@ -370,24 +441,28 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 				result[i] = "NULL"
 			} else {
 
-				/*
-				 TODO:
-				 Pass type information from column
-				 Get smarter about escaping types, particularly numeric
-				*/
+				t := types[i].DatabaseTypeName()
 
-				result[i] = fmt.Sprintf("'%s'", escape(string(raw)))
+				// TODO: are there more numeric types?
+				if t == "BIGINT" || t == "INT" || t == "DECIMAL" || t == "FLOAT" {
+					result[i] = string(raw)
+				} else {
+					result[i] = fmt.Sprintf("'%s'", escape(string(raw)))
+				}
 			}
 		}
 
 		values := fmt.Sprintf("(%s)", strings.Join(result, ","))
 
-		if uint64(buffer.Len()+len(values)) > BulkInsertLimit {
+		if int64(buffer.Len()+len(values)) > BulkInsertLimit {
 			buffer.WriteString(";\n")
-			n, err := buffer.WriteTo(f)
-			atomic.AddInt64(&BytesDumped, n)
-			check(err)
-			buffer.Reset()
+
+			if canSafelyWriteToTmpdir(int64(buffer.Len())) {
+				n, err := buffer.WriteTo(f)
+				atomic.AddInt64(&BytesDumped, n)
+				check(err)
+				buffer.Reset()
+			}
 		}
 
 		if buffer.Len() == 0 {
@@ -403,16 +478,48 @@ func dumpTableData(db *sql.DB, schema string, table string, primaryKey string, i
 
 	if buffer.Len() > 0 {
 		buffer.WriteString(";\n")
-		n, err := buffer.WriteTo(f)
-		atomic.AddInt64(&BytesDumped, n)
-		check(err)
-		buffer.Reset()
+
+		if canSafelyWriteToTmpdir(int64(buffer.Len())) {
+			n, err := buffer.WriteTo(f)
+			atomic.AddInt64(&BytesDumped, n)
+			check(err)
+			buffer.Reset()
+		}
 	}
 
 	f.Close()
-	FilesDumpCompleted += 1
+	atomic.AddInt64(&FilesDumpCompleted, 1)
 	TableCopyWg.Add(1)
 	go copyFileToS3(file, "table")
+
+}
+
+/*
+ Check to see it's safe to write nBytes to
+ the tmpdir and not exceed TmpDirMax.
+ This is not thread-safe, so it's possible size
+ could be exceeded.
+*/
+
+func canSafelyWriteToTmpdir(nBytes int64) bool {
+
+	for {
+
+		freeSpace := TmpDirMax - (BytesDumped - BytesCopied)
+
+		if nBytes > freeSpace {
+			runtime.Gosched()           // Give prority to other gorountines, this ones blocked.
+			time.Sleep(5 * time.Second) // Waiting on S3 copy.
+			// the status thread will warn no free space.
+			continue
+		} else {
+			log.Debug(fmt.Sprintf("Free Space: %d, Requested: %d", freeSpace, nBytes))
+			break
+		}
+
+	}
+
+	return true
 
 }
 
@@ -436,7 +543,6 @@ func copyFileToS3(filename string, copyType string) {
 	}
 	defer file.Close()
 
-	//select Region to use.
 	conf := aws.Config{Region: aws.String(AwsS3Region)}
 	sess := session.New(&conf)
 	svc := s3manager.NewUploader(sess)
@@ -455,10 +561,13 @@ func copyFileToS3(filename string, copyType string) {
 
 	log.Debug(fmt.Sprintf("Successfully uploaded %s to %s\n", filename, result.Location))
 
+	os.Remove(filename) // Still open, it will free space on close
+
+	atomic.AddInt64(&FilesCopyCompleted, 1)
+	fi, _ := file.Stat()
+	atomic.AddInt64(&BytesCopied, fi.Size())
+
 	if copyType != "schema" {
-		FilesCopyCompleted += 1
-		fi, _ := file.Stat()
-		atomic.AddInt64(&BytesCopied, fi.Size())
 		TableCopyWg.Done()
 	} else {
 		SchemaCopyWg.Done()
