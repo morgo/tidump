@@ -6,7 +6,6 @@ import (
 	log "github.com/sirupsen/logrus"
 	"io/ioutil"
 	"os"
-	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 )
@@ -17,19 +16,6 @@ func getenv(key, fallback string) string {
 		return fallback
 	}
 	return value
-}
-
-func setTiDBSnapshot(db *sql.DB) {
-
-	query := fmt.Sprintf("SET tidb_snapshot = '%s'", MySQLNow)
-	time.Sleep(time.Second) // finish this second first
-	_, err := db.Exec(query)
-	log.Debug(query)
-
-	if err != nil {
-		log.Fatal("Could not set tidb_snapshot.  Check MySQL_CONNECTION is configured and server is TiDB.")
-	}
-
 }
 
 func preflightChecks(db *sql.DB) {

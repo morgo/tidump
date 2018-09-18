@@ -46,3 +46,10 @@ func discoverTableMinMax(db *sql.DB, schema string, table string, primaryKey str
 func discoverRowsPerFile(avgRowLength int, fileTargetSize int64) int {
 	return int(math.Abs(math.Floor(float64(fileTargetSize) / float64(avgRowLength))))
 }
+
+func check(e error) {
+	if e != nil {
+		log.Fatal(e)
+		panic(e)
+	}
+}

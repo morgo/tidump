@@ -13,6 +13,14 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
+func Map(vs []string, f func(string) string) []string {
+	vsm := make([]string, len(vs))
+	for i, v := range vs {
+		vsm[i] = f(v)
+	}
+	return vsm
+}
+
 func prepareDumpTable(db *sql.DB, schema string, table string, primaryKey string, avgRowLength int, dataLength int64, insertableCols string) {
 
 	if dataLength < FileTargetSize {
