@@ -82,7 +82,7 @@ func dumpTableData(d DumpFile) {
 	result := make([]string, len(cols))
 
 	dest := make([]interface{}, len(cols)) // A temporary interface{} slice
-	for i, _ := range rawResult {
+	for i := range rawResult {
 		dest[i] = &rawResult[i] // Put pointers to each string in the interface slice
 	}
 
