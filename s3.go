@@ -24,7 +24,7 @@ func (d *Dumper) copyFileToS3(filename string, copyType string) {
 	sess := session.New(&conf)
 	svc := s3manager.NewUploader(sess)
 
-	log.Debug("Uploading file to S3...")
+	log.Debugf("Uploading file to S3: %s", filename)
 
 	result, err := svc.Upload(&s3manager.UploadInput{
 		Bucket: aws.String(d.cfg.AwsS3Bucket),
@@ -35,7 +35,7 @@ func (d *Dumper) copyFileToS3(filename string, copyType string) {
 		log.Fatalf("S3 write error: %s", err)
 	}
 
-	log.Debugf("Successfully uploaded %s to %s\n", filename, result.Location)
+	log.Debugf("Successfully uploaded %s to %s", filename, result.Location)
 
 	os.Remove(filename) // Still open, it will free space on close
 
