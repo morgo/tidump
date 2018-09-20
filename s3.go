@@ -12,7 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 )
 
-func copyFileToS3(filename string, copyType string) {
+func (d *Dumper) copyFileToS3(filename string, copyType string) {
 
 	file, err := os.Open(filename)
 	if err != nil {
@@ -20,15 +20,15 @@ func copyFileToS3(filename string, copyType string) {
 	}
 	defer file.Close()
 
-	conf := aws.Config{Region: aws.String(AwsS3Region)}
+	conf := aws.Config{Region: aws.String(d.cfg.AwsS3Region)}
 	sess := session.New(&conf)
 	svc := s3manager.NewUploader(sess)
 
 	log.Debug("Uploading file to S3...")
 
 	result, err := svc.Upload(&s3manager.UploadInput{
-		Bucket: aws.String(AwsS3Bucket),
-		Key:    aws.String(fmt.Sprintf("%s/%s", AwsS3BucketPrefix, filepath.Base(filename))),
+		Bucket: aws.String(d.cfg.AwsS3Bucket),
+		Key:    aws.String(fmt.Sprintf("%s/%s", d.cfg.AwsS3BucketPrefix, filepath.Base(filename))),
 		Body:   file,
 	})
 	if err != nil {
@@ -39,14 +39,14 @@ func copyFileToS3(filename string, copyType string) {
 
 	os.Remove(filename) // Still open, it will free space on close
 
-	atomic.AddInt64(&FilesCopyCompleted, 1)
+	atomic.AddInt64(&d.FilesCopyCompleted, 1)
 	fi, _ := file.Stat()
-	atomic.AddInt64(&BytesCopied, fi.Size())
+	atomic.AddInt64(&d.BytesCopied, fi.Size())
 
 	if copyType != "schema" {
-		TableCopyWg.Done()
+		d.TableCopyWg.Done()
 	} else {
-		SchemaCopyWg.Done()
+		d.SchemaCopyWg.Done()
 	}
 
 }

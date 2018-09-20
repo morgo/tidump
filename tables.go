@@ -24,17 +24,17 @@ func Map(vs []string, f func(string) string) []string {
  quite a lot.
 */
 
-func prepareDumpTable(schema string, table string, avgRowLength int, dataLength int64, primaryKey string, insertableCols string) {
+func (d *Dumper) prepareDumpTable(schema string, table string, avgRowLength int, dataLength int64, primaryKey string, insertableCols string) {
 
-	if dataLength < FileTargetSize {
-		TableDumpWg.Add(1)
-		d := createDumpFile(schema, table, primaryKey, insertableCols, 0, 0) // small table
-		go dumpTableData(d)
-		atomic.AddInt64(&TotalFiles, 1)
+	if dataLength < d.cfg.FileTargetSize {
+		d.TableDumpWg.Add(1)
+		df := d.createDumpFile(schema, table, primaryKey, insertableCols, 0, 0) // small table
+		go d.dumpTableData(df)
+		atomic.AddInt64(&d.TotalFiles, 1)
 	} else {
 
-		rowsPerFile := discoverRowsPerFile(avgRowLength, FileTargetSize)
-		min, max := discoverTableMinMax(schema, table, primaryKey)
+		rowsPerFile := d.discoverRowsPerFile(avgRowLength, d.cfg.FileTargetSize)
+		min, max := d.discoverTableMinMax(schema, table, primaryKey)
 
 		for i := min; i < max; i += rowsPerFile {
 
@@ -50,27 +50,27 @@ func prepareDumpTable(schema string, table string, avgRowLength int, dataLength 
 			}
 
 			log.Debugf("Table: %s.%s.  Start: %d End: %d\n", schema, table, start, end)
-			TableDumpWg.Add(1)
-			d := createDumpFile(schema, table, primaryKey, insertableCols, start, end)
-			go dumpTableData(d)
-			atomic.AddInt64(&TotalFiles, 1)
+			d.TableDumpWg.Add(1)
+			df := d.createDumpFile(schema, table, primaryKey, insertableCols, start, end)
+			go d.dumpTableData(df)
+			atomic.AddInt64(&d.TotalFiles, 1)
 
 		}
 	}
 }
 
-func dumpTableData(d dumpFile) {
+func (d *Dumper) dumpTableData(df dumpFile) {
 
-	defer TableDumpWg.Done()
+	defer d.TableDumpWg.Done()
 
-	db := newDbConnection()
+	db := d.newDbConnection()
 	defer db.Close()
 
-	rows, err := db.Query(d.sql)
-	log.Debug(d.sql)
+	rows, err := db.Query(df.sql)
+	log.Debug(df.sql)
 
 	if err != nil {
-		log.Fatal("Could not retrieve table data: %s", d.schema, d.table)
+		log.Fatal("Could not retrieve table data: %s", df.schema, df.table)
 	}
 
 	cols, _ := rows.Columns()
@@ -111,30 +111,30 @@ func dumpTableData(d dumpFile) {
 
 		values := fmt.Sprintf("(%s)", strings.Join(result, ","))
 
-		if int64(d.bufferLen()+len(values)) > BulkInsertLimit {
-			d.write(";\n")
-			d.flush()
+		if int64(df.bufferLen()+len(values)) > d.cfg.BulkInsertLimit {
+			df.write(";\n")
+			df.flush()
 		}
 
-		if d.bufferLen() == 0 {
-			d.write(fmt.Sprintf("INSERT INTO %s (%s) VALUES \n%s", d.table, colsstr, values))
+		if df.bufferLen() == 0 {
+			df.write(fmt.Sprintf("INSERT INTO %s (%s) VALUES \n%s", df.table, colsstr, values))
 		} else {
-			d.write(",\n")
-			d.write(values)
+			df.write(",\n")
+			df.write(values)
 		}
 
 	}
 
 	// Flush any remaining buffer
 
-	if d.bufferLen() > 0 {
-		d.write(";\n")
-		d.flush()
+	if df.bufferLen() > 0 {
+		df.write(";\n")
+		df.flush()
 	}
 
-	d.close()
-	atomic.AddInt64(&FilesDumpCompleted, 1)
-	TableCopyWg.Add(1)
-	go copyFileToS3(d.file, "table")
+	df.close()
+	atomic.AddInt64(&d.FilesDumpCompleted, 1)
+	d.TableCopyWg.Add(1)
+	go d.copyFileToS3(df.file, "table")
 
 }

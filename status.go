@@ -5,23 +5,23 @@ import (
 	"time"
 )
 
-func status() {
+func (d *Dumper) status() {
 
-	freeSpace := TmpDirMax - (BytesDumped - BytesCopied)
+	freeSpace := d.cfg.TmpDirMax - (d.BytesDumped - d.BytesCopied)
 
-	log.Infof("TotalFiles: %d, FilesDumpCompleted: %d, FilesCopyCompleted: %d", TotalFiles, FilesDumpCompleted, FilesCopyCompleted)
-	log.Infof("BytesDumped: %d, Copied (success): %d, TmpSize: %d", BytesDumped, BytesCopied, (BytesDumped - BytesCopied))
+	log.Infof("TotalFiles: %d, FilesDumpCompleted: %d, FilesCopyCompleted: %d", d.TotalFiles, d.FilesDumpCompleted, d.FilesCopyCompleted)
+	log.Infof("BytesDumped: %d, Copied (success): %d, TmpSize: %d", d.BytesDumped, d.BytesCopied, (d.BytesDumped - d.BytesCopied))
 
-	if freeSpace <= FileTargetSize {
+	if freeSpace <= d.cfg.FileTargetSize {
 		log.Warningf("Low free space: %d bytes", freeSpace)
 	}
 
 }
 
-func publishStatus() {
+func (d *Dumper) publishStatus() {
 
 	for {
-		status()
+		d.status()
 		time.Sleep(5 * time.Second)
 	}
 

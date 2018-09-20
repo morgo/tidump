@@ -1,7 +1,6 @@
 package main
 
 import (
-	"database/sql"
 	"fmt"
 	"math"
 
@@ -16,10 +15,10 @@ import (
  https://github.com/pingcap/tidb/issues/7714
 */
 
-func discoverPrimaryKey(db *sql.DB, schema string, table string, likelyPrimaryKey string) (columnName string) {
+func (d *Dumper) discoverPrimaryKey(schema string, table string, likelyPrimaryKey string) (columnName string) {
 
 	query := fmt.Sprintf("SELECT _tidb_rowid FROM %s.%s LIMIT 1", schema, table)
-	_, err := db.Query(query)
+	_, err := d.db.Query(query)
 	log.Debug(query)
 
 	if err != nil {
@@ -32,10 +31,10 @@ func discoverPrimaryKey(db *sql.DB, schema string, table string, likelyPrimaryKe
 
 }
 
-func discoverTableMinMax(schema string, table string, primaryKey string) (min int64, max int64) {
+func (d *Dumper) discoverTableMinMax(schema string, table string, primaryKey string) (min int64, max int64) {
 
-	db := newDbConnection() // won't be required soon
-	defer db.Close()        // i_s should return min/max
+	db := d.newDbConnection() // won't be required soon
+	defer db.Close()          // i_s should return min/max
 
 	query := fmt.Sprintf("SELECT MIN(%s) as min, MAX(%s) max FROM `%s`.`%s`", primaryKey, primaryKey, schema, table)
 	err := db.QueryRow(query).Scan(&min, &max)
@@ -49,6 +48,6 @@ func discoverTableMinMax(schema string, table string, primaryKey string) (min in
 
 }
 
-func discoverRowsPerFile(avgRowLength int, fileTargetSize int64) int64 {
+func (d *Dumper) discoverRowsPerFile(avgRowLength int, fileTargetSize int64) int64 {
 	return int64(math.Abs(math.Floor(float64(fileTargetSize) / float64(avgRowLength))))
 }

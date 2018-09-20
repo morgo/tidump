@@ -8,16 +8,16 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-func newDbConnection() *sql.DB {
+func (d *Dumper) newDbConnection() *sql.DB {
 
 	/* Create a new MySQL connection for this thread */
-	db, err := sql.Open("mysql", MySQLConnectionString)
+	db, err := sql.Open("mysql", d.cfg.MySQLConnection)
 
 	if err != nil {
 		log.Fatal("Could not create new connection to MySQL.")
 	}
 
-	setTiDBSnapshot(db) // set worker thread to same place as master thread.
+	d.setTiDBSnapshot(db) // set worker thread to same place as master thread.
 	return db
 
 }
@@ -27,9 +27,9 @@ func newDbConnection() *sql.DB {
  In future this might be configurable.
 */
 
-func setTiDBSnapshot(db *sql.DB) {
+func (d *Dumper) setTiDBSnapshot(db *sql.DB) {
 
-	query := fmt.Sprintf("SET tidb_snapshot = '%s'", MySQLNow)
+	query := fmt.Sprintf("SET tidb_snapshot = '%s'", d.MySQLNow)
 	_, err := db.Exec(query)
 	log.Debug(query)
 
@@ -45,7 +45,7 @@ func setTiDBSnapshot(db *sql.DB) {
  https://github.com/pingcap/tidb/issues/7714
 */
 
-func findAllTables(regex string) (sql string) {
+func (d *Dumper) findAllTables(regex string) (sql string) {
 
 	sql = `SELECT
  t.table_schema,

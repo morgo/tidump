@@ -9,26 +9,26 @@ import (
 	"github.com/ngaut/log"
 )
 
-func prepareDumpSchema(schema string, table string) {
+func (d *Dumper) prepareDumpSchema(schema string, table string) {
 
-	go dumpCreateTable(schema, table)
-	SchemaDumpWg.Add(1)
+	go d.dumpCreateTable(schema, table)
+	d.SchemaDumpWg.Add(1)
 
 }
 
-func dumpCreateTable(schema string, table string) {
+func (d *Dumper) dumpCreateTable(schema string, table string) {
 
-	defer SchemaDumpWg.Done()
+	defer d.SchemaDumpWg.Done()
 
-	db := newDbConnection()
+	db := d.newDbConnection()
 	defer db.Close()
 
-	atomic.AddInt64(&TotalFiles, 1)
+	atomic.AddInt64(&d.TotalFiles, 1)
 
 	var fakeTable, createTable string
 
 	query := fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", schema, table)
-	file := fmt.Sprintf("%s/%s.%s-schema.sql", TmpDir, schema, table)
+	file := fmt.Sprintf("%s/%s.%s-schema.sql", d.cfg.TmpDir, schema, table)
 
 	err := db.QueryRow(query).Scan(&fakeTable, &createTable)
 	log.Debug(query)
@@ -39,7 +39,7 @@ func dumpCreateTable(schema string, table string) {
 
 	createTable = fmt.Sprintf("%s;\n", createTable)
 
-	if canSafelyWriteToTmpdir(int64(len(createTable))) {
+	if d.canSafelyWriteToTmpdir(int64(len(createTable))) {
 
 		f, err := os.Create(file)
 		log.Debugf("Creating file %s", file)
@@ -54,12 +54,12 @@ func dumpCreateTable(schema string, table string) {
 			log.Fatal("Could not write %d bytes to temporary file: %s", n, file)
 		}
 
-		atomic.AddInt64(&BytesDumped, int64(n))
+		atomic.AddInt64(&d.BytesDumped, int64(n))
 
 		f.Close()
-		SchemaCopyWg.Add(1)
-		atomic.AddInt64(&FilesDumpCompleted, 1)
-		go copyFileToS3(file, "schema")
+		d.SchemaCopyWg.Add(1)
+		atomic.AddInt64(&d.FilesDumpCompleted, 1)
+		go d.copyFileToS3(file, "schema")
 
 	}
 

@@ -12,6 +12,18 @@ import (
 	"time"
 )
 
+type dumpFile struct {
+	schema string
+	table  string
+	sql    string
+	file   string
+	fi     *os.File
+	gf     *gzip.Writer
+	fw     *bufio.Writer
+	buffer *bytes.Buffer
+	d      *Dumper
+}
+
 /*
  Check to see it's safe to write nBytes to
  the tmpdir and not exceed TmpDirMax.
@@ -19,11 +31,11 @@ import (
  could be exceeded.
 */
 
-func canSafelyWriteToTmpdir(nBytes int64) bool {
+func (d *Dumper) canSafelyWriteToTmpdir(nBytes int64) bool {
 
 	for {
 
-		freeSpace := TmpDirMax - (BytesDumped - BytesCopied)
+		freeSpace := d.cfg.TmpDirMax - (d.BytesDumped - d.BytesCopied)
 
 		if nBytes > freeSpace {
 			runtime.Gosched()           // Give prority to other gorountines, this ones blocked.
@@ -40,25 +52,15 @@ func canSafelyWriteToTmpdir(nBytes int64) bool {
 
 }
 
-func cleanupTmpDir() {
-	os.RemoveAll(TmpDir) // delete temporary directory
+func (d *Dumper) cleanupTmpDir() {
+	os.RemoveAll(d.cfg.TmpDir) // delete temporary directory
 }
 
-type dumpFile struct {
-	schema string
-	table  string
-	sql    string
-	file   string
-	fi     *os.File
-	gf     *gzip.Writer
-	fw     *bufio.Writer
-	buffer *bytes.Buffer
-}
+func (d *Dumper) createDumpFile(schema string, table string, primaryKey string, insertableCols string, start int64, end int64) (df dumpFile) {
 
-func createDumpFile(schema string, table string, primaryKey string, insertableCols string, start int64, end int64) (d dumpFile) {
-
-	d.schema = schema
-	d.table = table
+	df.schema = schema
+	df.table = table
+	df.d = d // hack
 
 	startSql := "1=1"
 	endSql := "1=1"
@@ -71,58 +73,58 @@ func createDumpFile(schema string, table string, primaryKey string, insertableCo
 		endSql = fmt.Sprintf("%s < %d", primaryKey, end)
 	}
 
-	d.sql = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE %s AND %s", insertableCols, schema, table, startSql, endSql)
-	d.file = fmt.Sprintf("%s/%s.%s.%d.sql.gz", TmpDir, schema, table, start)
+	df.sql = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE %s AND %s", insertableCols, schema, table, startSql, endSql)
+	df.file = fmt.Sprintf("%s/%s.%s.%d.sql.gz", d.cfg.TmpDir, schema, table, start)
 
 	var err error
 
-	d.fi, err = os.Create(d.file)
+	df.fi, err = os.Create(df.file)
 
 	if err != nil {
-		log.Fatalf("Error in creating file: %s", d.file)
+		log.Fatalf("Error in creating file: %s", df.file)
 	}
 
-	d.gf = gzip.NewWriter(d.fi)
-	d.fw = bufio.NewWriter(d.gf)
-	d.buffer = new(bytes.Buffer)
+	df.gf = gzip.NewWriter(df.fi)
+	df.fw = bufio.NewWriter(df.gf)
+	df.buffer = new(bytes.Buffer)
 
 	return
 
 }
 
-func (d dumpFile) close() {
-	d.fw.Flush()
+func (df dumpFile) close() {
+	df.fw.Flush()
 	// Close the gzip first.
-	d.gf.Close()
-	d.fi.Close()
+	df.gf.Close()
+	df.fi.Close()
 }
 
-func (d dumpFile) write(s string) (int, error) {
+func (df dumpFile) write(s string) (int, error) {
 
 	// TODO: Get the zlib buffer len?
-	return d.buffer.WriteString(s)
+	return df.buffer.WriteString(s)
 	// TODO: return zlib new length - old length?
 
 }
 
-func (d dumpFile) bufferLen() int {
-	return d.buffer.Len()
+func (df dumpFile) bufferLen() int {
+	return df.buffer.Len()
 }
 
-func (d dumpFile) flush() {
+func (df dumpFile) flush() {
 
-	uncompressedLen := int64(d.bufferLen())
+	uncompressedLen := int64(df.bufferLen())
 
-	if canSafelyWriteToTmpdir(uncompressedLen) {
+	if df.d.canSafelyWriteToTmpdir(uncompressedLen) {
 
-		n, err := d.buffer.WriteTo(d.fw)
-		atomic.AddInt64(&BytesDumped, n)
+		n, err := df.buffer.WriteTo(df.fw)
+		atomic.AddInt64(&df.d.BytesDumped, n)
 
 		if err != nil {
-			log.Fatal("Could not write to gz file: %s", d.file)
+			log.Fatal("Could not write to gz file: %s", df.file)
 		}
 
-		d.buffer.Reset()
+		df.buffer.Reset()
 	}
 
 }

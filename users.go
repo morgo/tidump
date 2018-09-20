@@ -1,11 +1,5 @@
 package main
 
-import (
-	"database/sql"
-
-	_ "github.com/go-sql-driver/mysql"
-)
-
 /*
  I am waiting for the server to support SHOW CREATE USER,
  so semantically this can be:
@@ -17,7 +11,7 @@ import (
  https://github.com/pingcap/tidb/issues/7733
 */
 
-func dumpUsers(db *sql.DB) bool {
+func (d *Dumper) dumpUsers() bool {
 
 	return true
 
