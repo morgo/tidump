@@ -27,6 +27,9 @@ type dumpFile struct {
 
 func (dt *dumpTable) NewDumpFile(start int64, end int64) (*dumpFile, error) {
 
+	dt.d.TableDumpWg.Add(1)
+	atomic.AddInt64(&dt.d.TotalFiles, 1)
+
 	var err error
 
 	df := &dumpFile{
@@ -46,7 +49,7 @@ func (dt *dumpTable) NewDumpFile(start int64, end int64) (*dumpFile, error) {
 		endSql = fmt.Sprintf("%s < %d", df.dt.primaryKey, df.end)
 	}
 
-	df.sql = fmt.Sprintf("SELECT %s FROM `%s`.`%s` WHERE %s AND %s", df.dt.insertableColumns, df.dt.schema, df.dt.table, startSql, endSql)
+	df.sql = fmt.Sprintf("SELECT LOW_PRIORITY %s FROM `%s`.`%s` WHERE %s AND %s", df.dt.insertableColumns, df.dt.schema, df.dt.table, startSql, endSql)
 	df.file = fmt.Sprintf("%s/%s.%s.%d.sql.gz", df.dt.d.cfg.TmpDir, df.dt.schema, df.dt.table, df.start)
 
 	df.fi, err = os.Create(df.file)
@@ -104,14 +107,13 @@ func (df *dumpFile) dump() {
 
 	defer df.dt.d.TableDumpWg.Done()
 
-	db := df.dt.d.newDbConnection()
-	defer db.Close()
+	tx := df.dt.d.newTx()
 
-	rows, err := db.Query(df.sql)
+	rows, err := tx.Query(df.sql)
 	log.Debug(df.sql)
 
 	if err != nil {
-		log.Fatal("Could not retrieve table data: %s", df.dt.schema, df.dt.table)
+		log.Fatal("Could not retrieve table data: %s, error: %s", df.dt.schema, df.dt.table, err)
 	}
 
 	cols, _ := rows.Columns()
@@ -166,6 +168,8 @@ func (df *dumpFile) dump() {
 
 	}
 
+	tx.Commit() // return to pool
+
 	// Flush any remaining buffer
 
 	if df.bufferLen() > 0 {
@@ -174,8 +178,6 @@ func (df *dumpFile) dump() {
 	}
 
 	df.close()
-	atomic.AddInt64(&df.dt.d.FilesDumpCompleted, 1)
-	df.dt.d.TableCopyWg.Add(1)
-	go df.dt.d.copyFileToS3(df.file, "table")
+	df.dt.d.copyFileToS3(df.file)
 
 }

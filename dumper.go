@@ -13,7 +13,7 @@ import (
 	"github.com/ngaut/log"
 )
 
-type Dumper struct {
+type dumper struct {
 	BytesDumped        int64
 	BytesCopied        int64
 	FilesDumpCompleted int64
@@ -22,26 +22,28 @@ type Dumper struct {
 	MySQLNow           string // not configurable yet.
 	hostname           string
 	TableDumpWg        *sync.WaitGroup
-	TableCopyWg        *sync.WaitGroup
-	SchemaCopyWg       *sync.WaitGroup
 	SchemaDumpWg       *sync.WaitGroup
+	s3Wg               *sync.WaitGroup
 	cfg                *Config
-	db                 *sql.DB // master sql connection
+	db                 *sql.DB // sql connection
+	s3Semaphore        chan struct{}
 }
 
-func NewDumper(cfg *Config) (*Dumper, error) {
+func NewDumper(cfg *Config) (*dumper, error) {
 
 	db, err := sql.Open("mysql", cfg.MySQLConnection)
 	if err != nil {
 		log.Fatal("Could not connect to MySQL at %s.", cfg.MySQLConnection)
 	}
 
-	dumper := &Dumper{
+	db.SetMaxOpenConns(cfg.MySQLPoolSize)
+
+	dumper := &dumper{
 		cfg:          cfg,
 		TableDumpWg:  new(sync.WaitGroup),
-		TableCopyWg:  new(sync.WaitGroup),
-		SchemaCopyWg: new(sync.WaitGroup),
 		SchemaDumpWg: new(sync.WaitGroup),
+		s3Wg:         new(sync.WaitGroup),
+		s3Semaphore:  make(chan struct{}, cfg.AwsS3PoolSize),
 		db:           db,
 	}
 
@@ -49,26 +51,27 @@ func NewDumper(cfg *Config) (*Dumper, error) {
 
 }
 
-func (d *Dumper) dump() {
+func (d *dumper) Dump() {
 
 	d.preflightChecks()
-	d.setTiDBSnapshot(d.db)
 
 	go d.publishStatus() // every few seconds
 
 	d.dumpUsers() // currently does nothing
 
+	tx := d.newTx()
+	tx.Exec("SET group_concat_max_len = 1024 * 1024")
+
 	query := d.findAllTables(d.cfg.MySQLRegex)
-	tables, err := d.db.Query(query)
-	log.Debug(query)
+	tables, err := tx.Query(query)
 
 	if err != nil {
-		log.Fatal("Check MySQL connection is configured correctly.")
+		log.Fatalf("Check MySQL connection is configured correctly: %s", err)
 	}
 
 	for tables.Next() {
 
-		dt, _ := d.NewDumpTable()
+		dt, _ := d.newDumpTable()
 
 		err = tables.Scan(&dt.schema, &dt.table, &dt.avgRowLength, &dt.dataLength, &dt.likelyPrimaryKey, &dt.insertableColumns)
 		if err != nil {
@@ -79,6 +82,8 @@ func (d *Dumper) dump() {
 
 	}
 
+	tx.Commit() // return to pool.
+
 	/*
 	 The work is handled in goroutines.
 	 The dump routines write to the tmpdir, and then
@@ -86,23 +91,24 @@ func (d *Dumper) dump() {
 	*/
 
 	d.TableDumpWg.Wait()
-	d.TableCopyWg.Wait()
 	d.SchemaDumpWg.Wait()
-	d.SchemaCopyWg.Wait()
+	d.s3Wg.Wait()
 
 	d.cleanupTmpDir()
+	d.db.Close()
 	d.status() // print status before exiting
 
 	return
 
 }
 
-func (d *Dumper) status() {
+func (d *dumper) status() {
 
 	freeSpace := d.cfg.TmpDirMax - (d.BytesDumped - d.BytesCopied)
 
 	log.Infof("TotalFiles: %d, FilesDumpCompleted: %d, FilesCopyCompleted: %d", d.TotalFiles, d.FilesDumpCompleted, d.FilesCopyCompleted)
 	log.Infof("BytesDumped: %d, Copied (success): %d, TmpSize: %d", d.BytesDumped, d.BytesCopied, (d.BytesDumped - d.BytesCopied))
+	log.Debugf("Goroutines in existence: %d", runtime.NumGoroutine())
 
 	if freeSpace <= d.cfg.FileTargetSize {
 		log.Warningf("Low free space: %d bytes", freeSpace)
@@ -110,7 +116,7 @@ func (d *Dumper) status() {
 
 }
 
-func (d *Dumper) publishStatus() {
+func (d *dumper) publishStatus() {
 
 	for {
 		d.status()
@@ -121,21 +127,21 @@ func (d *Dumper) publishStatus() {
 
 // Some of this could be moved to config.
 
-func (d *Dumper) preflightChecks() {
-
-	d.db.Exec("SET group_concat_max_len = 1024 * 1024")
+func (d *dumper) preflightChecks() {
 
 	time.Sleep(time.Second) // finish this second first
 	query := "SELECT @@hostname, NOW()-INTERVAL 1 SECOND"
-	err := d.db.QueryRow(query).Scan(&d.hostname, &d.MySQLNow)
-	log.Debug(query)
+
+	tx := d.newTx()
+	err := tx.QueryRow(query).Scan(&d.hostname, &d.MySQLNow)
+	tx.Commit()
 
 	if err != nil {
 		log.Fatalf("Could not get server time for tidb_snapshot: %s", err)
 	}
 
-	// hack
-	d.cfg.AwsS3BucketPrefix = fmt.Sprintf("tidump-%s/%s", d.hostname, StartTime.Format("2006-01-02"))
+	// @TODO: don't use startime but tidb_snapshot time!
+	d.cfg.AwsS3BucketPrefix = fmt.Sprintf("tidump-%s/%s", d.hostname, startTime.Format("2006-01-02"))
 	log.Infof("Uploading to %s/%s", d.cfg.AwsS3Bucket, d.cfg.AwsS3BucketPrefix)
 
 	/*
@@ -163,41 +169,32 @@ func (d *Dumper) preflightChecks() {
  https://github.com/pingcap/tidb/issues/7733
 */
 
-func (d *Dumper) dumpUsers() bool {
+func (d *dumper) dumpUsers() bool {
 	return true
 }
 
 /*
- This is for worker threads
+ This makes sure they have the tidb_snapshot set.
+ Note: without a transaction, go to not guarantee
+ the set statement will apply to the next connection.
 */
 
-func (d *Dumper) newDbConnection() *sql.DB {
+func (d *dumper) newTx() *sql.Tx {
 
-	db, err := sql.Open("mysql", d.cfg.MySQLConnection)
+	tx, err := d.db.Begin()
 
 	if err != nil {
-		log.Fatalf("Could not create new connection to MySQL: %s", err)
+		log.Fatalf("Could not begin new transaction: %s", err)
 	}
 
-	d.setTiDBSnapshot(db) // set all threads to same place
-	return db
-
-}
-
-/*
- Set the tidb_snapshot before doing anything else.
- In future this might be configurable.
-*/
-
-func (d *Dumper) setTiDBSnapshot(db *sql.DB) {
-
 	query := fmt.Sprintf("SET tidb_snapshot = '%s', tidb_force_priority = 'low_priority'", d.MySQLNow)
-	_, err := db.Exec(query)
-	log.Debug(query)
+	_, err = tx.Exec(query)
 
 	if err != nil {
 		log.Fatalf("Could not set tidb_snapshot: %s", err)
 	}
+
+	return tx
 
 }
 
@@ -207,7 +204,7 @@ func (d *Dumper) setTiDBSnapshot(db *sql.DB) {
  https://github.com/pingcap/tidb/issues/7714
 */
 
-func (d *Dumper) findAllTables(regex string) (sql string) {
+func (d *dumper) findAllTables(regex string) (sql string) {
 
 	sql = `SELECT
  t.table_schema,
@@ -242,7 +239,7 @@ WHERE
  could be exceeded.
 */
 
-func (d *Dumper) canSafelyWriteToTmpdir(nBytes int64) bool {
+func (d *dumper) canSafelyWriteToTmpdir(nBytes int64) bool {
 
 	for {
 
@@ -263,6 +260,6 @@ func (d *Dumper) canSafelyWriteToTmpdir(nBytes int64) bool {
 
 }
 
-func (d *Dumper) cleanupTmpDir() {
+func (d *dumper) cleanupTmpDir() {
 	os.RemoveAll(d.cfg.TmpDir) // delete temporary directory
 }

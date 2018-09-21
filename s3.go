@@ -12,13 +12,29 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 )
 
-func (d *Dumper) copyFileToS3(filename string, copyType string) {
+/*
+ The s3 library already uses goroutines to parallelize the copy.
+ Lets reduce to single threaded to not thread thrash,
+ and make sure progress is made in whole units.
+*/
+
+func (d *dumper) copyFileToS3(filename string) {
+
+	atomic.AddInt64(&d.FilesDumpCompleted, 1)
+	d.s3Wg.Add(1)
+	go d.doCopyFileToS3(filename)
+
+}
+
+func (d *dumper) doCopyFileToS3(filename string) {
 
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalf("Could not open file for upload: %s", filename)
 	}
+
 	defer file.Close()
+	defer os.Remove(filename)
 
 	conf := aws.Config{Region: aws.String(d.cfg.AwsS3Region)}
 	sess := session.New(&conf)
@@ -26,27 +42,33 @@ func (d *Dumper) copyFileToS3(filename string, copyType string) {
 
 	log.Debugf("Uploading file to S3: %s", filename)
 
+	/*
+	 Reduce concurrent uploads so that *some* files make it completely.
+	 This makes resume more viable as a feature.
+	 Note that the AWS S3 Library does use goroutines itself, and
+	 will add some level of concurrency below this.
+	*/
+
+	d.s3Semaphore <- struct{}{}
+
 	result, err := svc.Upload(&s3manager.UploadInput{
 		Bucket: aws.String(d.cfg.AwsS3Bucket),
 		Key:    aws.String(fmt.Sprintf("%s/%s", d.cfg.AwsS3BucketPrefix, filepath.Base(filename))),
 		Body:   file,
 	})
+
+	<-d.s3Semaphore // Unlock
+
 	if err != nil {
 		log.Fatalf("S3 write error: %s", err)
 	}
 
 	log.Debugf("Successfully uploaded %s to %s", filename, result.Location)
 
-	os.Remove(filename) // Still open, it will free space on close
-
 	atomic.AddInt64(&d.FilesCopyCompleted, 1)
 	fi, _ := file.Stat()
 	atomic.AddInt64(&d.BytesCopied, fi.Size())
 
-	if copyType != "schema" {
-		d.TableCopyWg.Done()
-	} else {
-		d.SchemaCopyWg.Done()
-	}
+	d.s3Wg.Done()
 
 }

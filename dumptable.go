@@ -18,7 +18,7 @@ type dumpTable struct {
 	insertableColumns string
 	avgRowLength      int
 	dataLength        int64
-	d                 *Dumper
+	d                 *dumper
 	min               int64
 	max               int64
 
@@ -26,7 +26,7 @@ type dumpTable struct {
 	rowsPerFile int64
 }
 
-func (d *Dumper) NewDumpTable() (*dumpTable, error) {
+func (d *dumper) newDumpTable() (*dumpTable, error) {
 
 	dt := &dumpTable{
 		d: d,
@@ -39,6 +39,8 @@ func (d *Dumper) NewDumpTable() (*dumpTable, error) {
 func (dt *dumpTable) dump() {
 
 	dt.discoverPrimaryKey()
+	dt.discoverRowsPerFile()
+	dt.discoverTableMinMax()
 
 	dt.d.SchemaDumpWg.Add(1)
 	go dt.dumpCreateTable() // async dump create table
@@ -57,14 +59,17 @@ func (dt *dumpTable) dump() {
 func (dt *dumpTable) discoverPrimaryKey() {
 
 	query := fmt.Sprintf("SELECT _tidb_rowid FROM %s.%s LIMIT 1", dt.schema, dt.table)
-	_, err := dt.d.db.Query(query)
-	log.Debug(query)
+
+	tx := dt.d.newTx()
+	_, err := tx.Query(query)
 
 	if err != nil {
 		dt.primaryKey = dt.likelyPrimaryKey
 	} else {
 		dt.primaryKey = "_tidb_rowid"
 	}
+
+	tx.Commit()
 
 	return
 
@@ -78,8 +83,9 @@ func (dt *dumpTable) discoverPrimaryKey() {
 func (dt *dumpTable) discoverTableMinMax() {
 
 	query := fmt.Sprintf("SELECT MIN(%s) as min, MAX(%s) max FROM `%s`.`%s`", dt.primaryKey, dt.primaryKey, dt.schema, dt.table)
-	err := dt.d.db.QueryRow(query).Scan(&dt.min, &dt.max)
-	log.Debug(query)
+	tx := dt.d.newTx()
+	err := tx.QueryRow(query).Scan(&dt.min, &dt.max)
+	tx.Commit()
 
 	if err != nil {
 		log.Fatalf("Could not determine min/max values for table: %s.%s", dt.schema, dt.table)
@@ -109,8 +115,9 @@ func (dt *dumpTable) dumpCreateTable() {
 	dt.schemaFile = fmt.Sprintf("%s/%s.%s-schema.sql", dt.d.cfg.TmpDir, dt.schema, dt.table)
 
 	var fake string
-	err := dt.d.db.QueryRow(query).Scan(&fake, &dt.createTable)
-	log.Debug(query)
+	tx := dt.d.newTx()
+	err := tx.QueryRow(query).Scan(&fake, &dt.createTable)
+	tx.Commit()
 
 	if err != nil {
 		log.Fatal("Could not SHOW CREATE TABLE for %s.%s", dt.schema, dt.table)
@@ -121,7 +128,7 @@ func (dt *dumpTable) dumpCreateTable() {
 	if dt.d.canSafelyWriteToTmpdir(int64(len(dt.createTable))) {
 
 		f, err := os.Create(dt.schemaFile)
-		log.Debugf("Creating file %s", dt.schemaFile)
+		defer f.Close()
 
 		if err != nil {
 			log.Fatal("Could not create temporary file: %s", dt.schemaFile)
@@ -134,11 +141,7 @@ func (dt *dumpTable) dumpCreateTable() {
 		}
 
 		atomic.AddInt64(&dt.d.BytesDumped, int64(n))
-
-		f.Close()
-		dt.d.SchemaCopyWg.Add(1)
-		atomic.AddInt64(&dt.d.FilesDumpCompleted, 1)
-		go dt.d.copyFileToS3(dt.schemaFile, "schema")
+		dt.d.copyFileToS3(dt.schemaFile)
 
 	}
 
@@ -154,14 +157,9 @@ func (dt *dumpTable) dumpCreateTable() {
 func (dt *dumpTable) prepareDumpFiles() {
 
 	if dt.dataLength < dt.d.cfg.FileTargetSize {
-		dt.d.TableDumpWg.Add(1)
 		df, _ := dt.NewDumpFile(0, 0) // small table
 		go df.dump()
-		atomic.AddInt64(&dt.d.TotalFiles, 1)
 	} else {
-
-		dt.discoverRowsPerFile()
-		dt.discoverTableMinMax()
 
 		for i := dt.min; i < dt.max; i += dt.rowsPerFile {
 
@@ -176,11 +174,8 @@ func (dt *dumpTable) prepareDumpFiles() {
 				end = 0
 			}
 
-			log.Debugf("Table: %s.%s.  Start: %d End: %d\n", dt.schema, dt.table, start, end)
-			dt.d.TableDumpWg.Add(1)
 			df, _ := dt.NewDumpFile(start, end)
 			go df.dump()
-			atomic.AddInt64(&dt.d.TotalFiles, 1)
 
 		}
 	}

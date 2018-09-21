@@ -15,19 +15,20 @@ func NewConfig() *Config {
 	cfg.FlagSet = flag.NewFlagSet("tidump", flag.ContinueOnError)
 	fs := cfg.FlagSet
 
-	fs.StringVar(&cfg.AwsS3Bucket, "s3-bucket", "backups.tocker.ca", "Name of S3 bucket to upload backups to.")
+	fs.StringVar(&cfg.AwsS3Bucket, "s3-bucket", "", "Name of S3 bucket to upload backups to.")
 	fs.StringVar(&cfg.AwsS3Region, "s3-region", "us-east-1", "S3 Region")
-	fs.StringVar(&cfg.AwsS3BucketPrefix, "s3-bucket-prefix", "tidump-hostname/YYYY-MM-DD", "Prefix to use when uploading files.")
+	fs.StringVar(&cfg.AwsS3BucketPrefix, "s3-bucket-prefix", "tidump-hostname/YYYY-MM-DD", "Prefix to use when uploading files.") // TODO
+	fs.IntVar(&cfg.AwsS3PoolSize, "s3-pool-size", 4, "Number of s3 files to concurrently copy to S3.")
 
 	fs.StringVar(&cfg.MySQLConnection, "mysql-connection", "root@tcp(localhost:4000)/", "A regular expression to filter which schemas and tables to include.")
-	fs.StringVar(&cfg.MySQLRegex, "mysql-regex", ".*", "A regular expression to filter which schemas and tables to include.")
-	fs.IntVar(&cfg.MySQLPoolSize, "mysql-pool-size", 10, "Number of threads.  Currently ignored.")
-	fs.StringVar(&cfg.TidbSnapshot, "tidb-snapshot", "", "Set the backup to a point in time.")
+	fs.StringVar(&cfg.MySQLRegex, "mysql-regex", ".*", "A regular expression to filter which schemas and tables to include.") // TODO
+	fs.IntVar(&cfg.MySQLPoolSize, "mysql-pool-size", 4, "Number of connections to MySQL.")
+	fs.StringVar(&cfg.TidbSnapshot, "tidb-snapshot", "", "Set the backup to a point in time.") // TODO
 
 	fs.StringVar(&cfg.LogLevel, "L", "info", "Loader log level: debug, info, warn, error, fatal")
 	//log file
 
-	fs.StringVar(&cfg.TmpDir, "tmpdir", "/tmp", "Store temporary dump files.")
+	fs.StringVar(&cfg.TmpDir, "tmpdir", "/tmp", "Store temporary dump files.") // TODO
 	fs.Int64Var(&cfg.FileTargetSize, "file-target-size", (100 * 1024 * 1024), "Target size of files")
 	fs.Int64Var(&cfg.BulkInsertLimit, "bulk-insert-limit", (16 * 1024 * 1024), "Bulk insert limit")
 	fs.Int64Var(&cfg.TmpDirMax, "tmpdir-max", (5 * 1024 * 1024 * 1024), "Max size of tmpdir (goal)")
@@ -43,6 +44,7 @@ type Config struct {
 	AwsS3Bucket       string `toml:"s3-bucket" json:"s3-bucket"`
 	AwsS3Region       string `toml:"s3-region" json:"s3-region"`
 	AwsS3BucketPrefix string `toml:"s3-bucket-prefix" json:"s3-bucket-prefix"`
+	AwsS3PoolSize     int    `toml:"s3-pool-size" json:"s3-pool-size"`
 	MySQLConnection   string `toml:"mysql-connection" json:"mysql-connection"`
 	MySQLRegex        string `toml:"mysql-regex" json:"mysql-regex"`
 	MySQLPoolSize     int    `toml:"mysql-pool-size" json:"mysql-pool-size"` /* TODO */

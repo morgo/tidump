@@ -2,9 +2,7 @@
  TODO:
  * There is a bug in counting local dump bytes.  It should be compressed size.
  * Fix races with a read write lock.
- * Change the mysql connection to be a pool (currently workers use their own connection, and goroutines could overload source.)
- * Change the S3 copy to be a pool of N threads.
- * Add a "resume" function.
+ * Add a "resume" function
 
 LIMITATIONS:
 * Does not backup users.  Waiting on TIDB #7733.
@@ -25,10 +23,9 @@ import (
 )
 
 // Structure
-// Dumper -> DumpTable ->  DumpFile
-// Dumper -> DumpTable
+// Dumper (d) -> DumpTable (dt) ->  DumpFile (df)
 
-var StartTime = time.Now()
+var startTime = time.Now()
 
 func main() {
 
@@ -50,9 +47,9 @@ func main() {
 	}
 
 	d, _ := NewDumper(cfg)
-	d.dump() // start main loop.
+	d.Dump() // start main loop.
 
 	t := time.Now()
-	log.Infof("Completed in %s seconds.", t.Sub(StartTime))
+	log.Infof("Completed in %s seconds.", t.Sub(startTime))
 
 }
