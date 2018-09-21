@@ -118,7 +118,7 @@ func (df *dumpFile) dump() {
 
 	cols, _ := rows.Columns()
 	types, _ := rows.ColumnTypes()
-	colsstr := strings.Join(Map(cols, quoteIdentifier), ",")
+	colsstr := strings.Join(fnMap(cols, quoteIdentifier), ",")
 
 	// Result is your slice string.
 	rawResult := make([][]byte, len(cols))

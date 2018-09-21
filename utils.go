@@ -15,7 +15,7 @@ func getenv(key, fallback string) string {
 	return value
 }
 
-func Map(vs []string, f func(string) string) []string {
+func fnMap(vs []string, f func(string) string) []string {
 	vsm := make([]string, len(vs))
 	for i, v := range vs {
 		vsm[i] = f(v)

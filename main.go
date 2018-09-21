@@ -1,8 +1,13 @@
 /*
  TODO:
+ * Make sure all config options work.
+ * Check S3 first if backup pre-exists.  If it does and was not complete,
+   auto-resume by reading a "metadata.json" file.  Which contains:
+   - the tidb-snapshot
+   - min/max/primary key/rows-per-file of tables included in backup.
+
  * There is a bug in counting local dump bytes.  It should be compressed size.
  * Fix races with a read write lock.
- * Add a "resume" function
 
 LIMITATIONS:
 * Does not backup users.  Waiting on TIDB #7733.
