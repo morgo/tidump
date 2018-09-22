@@ -20,7 +20,7 @@ import (
 
 func (d *dumper) copyFileToS3(filename string) {
 
-	atomic.AddInt64(&d.FilesDumpCompleted, 1)
+	atomic.AddInt64(&d.filesDumpCompleted, 1) // creating the file finished
 	d.s3Wg.Add(1)
 	go d.doCopyFileToS3(filename)
 
@@ -65,9 +65,9 @@ func (d *dumper) doCopyFileToS3(filename string) {
 
 	log.Debugf("Successfully uploaded %s to %s", filename, result.Location)
 
-	atomic.AddInt64(&d.FilesCopyCompleted, 1)
+	atomic.AddInt64(&d.filesCopyCompleted, 1)
 	fi, _ := file.Stat()
-	atomic.AddInt64(&d.BytesCopied, fi.Size())
+	atomic.AddInt64(&d.bytesCopied, fi.Size())
 
 	d.s3Wg.Done()
 

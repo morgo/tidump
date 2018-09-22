@@ -14,19 +14,19 @@ import (
 )
 
 type dumper struct {
-	BytesDumped        int64
-	BytesCopied        int64
-	FilesDumpCompleted int64
-	FilesCopyCompleted int64
-	TotalFiles         int64
-	MySQLNow           string // not configurable yet.
+	bytesDumped        int64 // uncompressed bytes dumped from TiDB
+	bytesWritten       int64 // compressed bytes written (will be less)
+	bytesCopied        int64 // actual bytes copied to S3
+	filesDumpCompleted int64
+	filesCopyCompleted int64
+	totalFiles         int64
+	mySQLNow           string // not configurable yet.
 	hostname           string
-	TableDumpWg        *sync.WaitGroup
-	SchemaDumpWg       *sync.WaitGroup
+	dumpWg             *sync.WaitGroup
 	s3Wg               *sync.WaitGroup
+	s3Semaphore        chan struct{}
 	cfg                *Config
 	db                 *sql.DB // sql connection
-	s3Semaphore        chan struct{}
 }
 
 func NewDumper(cfg *Config) (*dumper, error) {
@@ -39,12 +39,11 @@ func NewDumper(cfg *Config) (*dumper, error) {
 	db.SetMaxOpenConns(cfg.MySQLPoolSize)
 
 	dumper := &dumper{
-		cfg:          cfg,
-		TableDumpWg:  new(sync.WaitGroup),
-		SchemaDumpWg: new(sync.WaitGroup),
-		s3Wg:         new(sync.WaitGroup),
-		s3Semaphore:  make(chan struct{}, cfg.AwsS3PoolSize),
-		db:           db,
+		cfg:         cfg,
+		dumpWg:      new(sync.WaitGroup),
+		s3Wg:        new(sync.WaitGroup),
+		s3Semaphore: make(chan struct{}, cfg.AwsS3PoolSize),
+		db:          db,
 	}
 
 	return dumper, nil
@@ -90,8 +89,7 @@ func (d *dumper) Dump() {
 	 trigger a goroutine for copying to S3.
 	*/
 
-	d.TableDumpWg.Wait()
-	d.SchemaDumpWg.Wait()
+	d.dumpWg.Wait()
 	d.s3Wg.Wait()
 
 	d.cleanupTmpDir()
@@ -104,10 +102,12 @@ func (d *dumper) Dump() {
 
 func (d *dumper) status() {
 
-	freeSpace := d.cfg.TmpDirMax - (d.BytesDumped - d.BytesCopied)
+	freeSpace := d.cfg.TmpDirMax - (d.bytesWritten - d.bytesCopied)
+	// TODO: format in MiB
 
-	log.Infof("TotalFiles: %d, FilesDumpCompleted: %d, FilesCopyCompleted: %d", d.TotalFiles, d.FilesDumpCompleted, d.FilesCopyCompleted)
-	log.Infof("BytesDumped: %d, Copied (success): %d, TmpSize: %d", d.BytesDumped, d.BytesCopied, (d.BytesDumped - d.BytesCopied))
+	log.Infof("Total Files: %d, Files Written: %d, Files Copied: %d", d.totalFiles, d.filesDumpCompleted, d.filesCopyCompleted)
+	log.Infof("Bytes Dumped: %d, Bytes Written (gz): %d Copied to S3: %d", d.bytesDumped, d.bytesWritten, d.bytesCopied)
+	log.Infof("tmpsize: %d", d.bytesWritten-d.bytesCopied)
 	log.Debugf("Goroutines in existence: %d", runtime.NumGoroutine())
 
 	if freeSpace <= d.cfg.FileTargetSize {
@@ -133,7 +133,7 @@ func (d *dumper) preflightChecks() {
 	query := "SELECT @@hostname, NOW()-INTERVAL 1 SECOND"
 
 	tx := d.newTx()
-	err := tx.QueryRow(query).Scan(&d.hostname, &d.MySQLNow)
+	err := tx.QueryRow(query).Scan(&d.hostname, &d.mySQLNow)
 	tx.Commit()
 
 	if err != nil {
@@ -187,7 +187,7 @@ func (d *dumper) newTx() *sql.Tx {
 		log.Fatalf("Could not begin new transaction: %s", err)
 	}
 
-	query := fmt.Sprintf("SET tidb_snapshot = '%s', tidb_force_priority = 'low_priority'", d.MySQLNow)
+	query := fmt.Sprintf("SET tidb_snapshot = '%s', tidb_force_priority = 'low_priority'", d.mySQLNow)
 	_, err = tx.Exec(query)
 
 	if err != nil {
@@ -243,7 +243,7 @@ func (d *dumper) canSafelyWriteToTmpdir(nBytes int64) bool {
 
 	for {
 
-		freeSpace := d.cfg.TmpDirMax - (d.BytesDumped - d.BytesCopied)
+		freeSpace := d.cfg.TmpDirMax - d.bytesWritten
 
 		if nBytes > freeSpace {
 			runtime.Gosched()           // Give prority to other gorountines, this ones blocked.

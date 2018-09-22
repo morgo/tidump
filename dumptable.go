@@ -42,7 +42,7 @@ func (dt *dumpTable) dump() {
 	dt.discoverRowsPerFile()
 	dt.discoverTableMinMax()
 
-	dt.d.SchemaDumpWg.Add(1)
+	dt.d.dumpWg.Add(1)
 	go dt.dumpCreateTable() // async dump create table
 
 	dt.prepareDumpFiles() // fan-out and async dump files
@@ -107,9 +107,9 @@ func (dt *dumpTable) discoverRowsPerFile() {
 
 func (dt *dumpTable) dumpCreateTable() {
 
-	defer dt.d.SchemaDumpWg.Done()
+	defer dt.d.dumpWg.Done()
 
-	atomic.AddInt64(&dt.d.TotalFiles, 1)
+	atomic.AddInt64(&dt.d.totalFiles, 1)
 
 	query := fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", dt.schema, dt.table)
 	dt.schemaFile = fmt.Sprintf("%s/%s.%s-schema.sql", dt.d.cfg.TmpDir, dt.schema, dt.table)
@@ -140,7 +140,8 @@ func (dt *dumpTable) dumpCreateTable() {
 			log.Fatal("Could not write %d bytes to temporary file: %s", n, dt.schemaFile)
 		}
 
-		atomic.AddInt64(&dt.d.BytesDumped, int64(n))
+		atomic.AddInt64(&dt.d.bytesDumped, int64(n))
+		atomic.AddInt64(&dt.d.bytesWritten, int64(n)) // it was uncompresssed
 		dt.d.copyFileToS3(dt.schemaFile)
 
 	}

@@ -12,23 +12,22 @@ import (
 )
 
 type dumpFile struct {
-	schema string
-	table  string
 	sql    string
 	file   string
-	start  int64
-	end    int64
+	start  int64 // primary key
+	end    int64 // offset
 	fi     *os.File
 	gf     *gzip.Writer
 	fw     *bufio.Writer
 	buffer *bytes.Buffer
 	dt     *dumpTable
+	zlen   *int64 // actual bytes
 }
 
 func (dt *dumpTable) NewDumpFile(start int64, end int64) (*dumpFile, error) {
 
-	dt.d.TableDumpWg.Add(1)
-	atomic.AddInt64(&dt.d.TotalFiles, 1)
+	dt.d.dumpWg.Add(1)
+	atomic.AddInt64(&dt.d.totalFiles, 1)
 
 	var err error
 
@@ -62,27 +61,59 @@ func (dt *dumpTable) NewDumpFile(start int64, end int64) (*dumpFile, error) {
 	df.fw = bufio.NewWriter(df.gf)
 	df.buffer = new(bytes.Buffer)
 
+	df.zlen = new(int64)
+
 	return df, nil
 
 }
 
 func (df dumpFile) close() {
+
 	df.fw.Flush()
 	// Close the gzip first.
 	df.gf.Close()
 	df.fi.Close()
+
+	df.updateBytesWritten(true)
+
 }
 
 func (df dumpFile) write(s string) (int, error) {
 
-	// TODO: Get the zlib buffer len?
 	return df.buffer.WriteString(s)
-	// TODO: return zlib new length - old length?
 
 }
 
 func (df dumpFile) bufferLen() int {
 	return df.buffer.Len()
+}
+
+/*
+ The stat to find length may return an incomplete number,
+ since flush() writes but does not sync.  Rather than
+ introduce a sync (expensive), we get a final
+ number after all files are closed to reconcile.
+*/
+
+func (df dumpFile) updateBytesWritten(final bool) {
+
+	var newzlen int64
+
+	if final {
+		file, _ := os.Open(df.file)
+		stat, _ := file.Stat()
+		newzlen = stat.Size()
+		file.Close()
+	} else {
+		stat, _ := df.fi.Stat()
+		newzlen = stat.Size()
+	}
+
+	diff := newzlen - *df.zlen
+
+	atomic.AddInt64(&df.dt.d.bytesWritten, diff)
+	*df.zlen = newzlen
+
 }
 
 func (df dumpFile) flush() {
@@ -92,7 +123,9 @@ func (df dumpFile) flush() {
 	if df.dt.d.canSafelyWriteToTmpdir(uncompressedLen) {
 
 		n, err := df.buffer.WriteTo(df.fw)
-		atomic.AddInt64(&df.dt.d.BytesDumped, n)
+		atomic.AddInt64(&df.dt.d.bytesDumped, n) // adding uncompressed len
+
+		df.updateBytesWritten(false)
 
 		if err != nil {
 			log.Fatal("Could not write to gz file: %s", df.file)
@@ -105,7 +138,7 @@ func (df dumpFile) flush() {
 
 func (df *dumpFile) dump() {
 
-	defer df.dt.d.TableDumpWg.Done()
+	defer df.dt.d.dumpWg.Done()
 
 	tx := df.dt.d.newTx()
 

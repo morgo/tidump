@@ -6,7 +6,6 @@
    - the tidb-snapshot
    - min/max/primary key/rows-per-file of tables included in backup.
 
- * There is a bug in counting local dump bytes.  It should be compressed size.
  * Fix races with a read write lock.
 
 LIMITATIONS:
