@@ -67,9 +67,9 @@ func (dt *dumpTable) discoverPrimaryKey() {
 		dt.primaryKey = dt.likelyPrimaryKey
 	} else {
 		dt.primaryKey = "_tidb_rowid"
+		rows.Close()
 	}
 
-	rows.Close()
 	tx.Commit()
 
 	return
