@@ -60,17 +60,17 @@ func (d *dumper) Dump() {
 	tx.Exec("SET group_concat_max_len = 1024 * 1024")
 
 	query := d.findAllTables(d.cfg.MySQLRegex)
-	tables, err := tx.Query(query)
+	rows, err := tx.Query(query)
 
 	if err != nil {
 		log.Fatalf("Check MySQL connection is configured correctly: %s", err)
 	}
 
-	for tables.Next() {
+	for rows.Next() {
 
 		dt, _ := d.newDumpTable()
 
-		err = tables.Scan(&dt.schema, &dt.table, &dt.avgRowLength, &dt.dataLength, &dt.likelyPrimaryKey, &dt.insertableColumns)
+		err = rows.Scan(&dt.schema, &dt.table, &dt.avgRowLength, &dt.dataLength, &dt.likelyPrimaryKey, &dt.insertableColumns)
 		if err != nil {
 			log.Fatal("Check MySQL connection is configured correctly.")
 		}
@@ -79,6 +79,7 @@ func (d *dumper) Dump() {
 
 	}
 
+	rows.Close()
 	tx.Commit() // return to pool.
 
 	/*
@@ -125,12 +126,12 @@ func (d *dumper) publishStatus() {
 
 func (d *dumper) preflightChecks() (err error) {
 
-	tx := d.newTx()
-	defer tx.Commit()
-
 	if len(d.cfg.AwsS3Bucket) == 0 {
 		log.Fatalf("Please specify an S3 bucket.  For example: tidump -s3-bucket backups.tocker.ca")
 	}
+
+	tx := d.newTx()
+	defer tx.Commit()
 
 	/* Auto create a tidb snapshot */
 

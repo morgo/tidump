@@ -199,6 +199,7 @@ func (df *dumpFile) dump() {
 
 	}
 
+	rows.Close()
 	tx.Commit() // return to pool
 
 	// Flush any remaining buffer

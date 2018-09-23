@@ -61,7 +61,7 @@ func (dt *dumpTable) discoverPrimaryKey() {
 	query := fmt.Sprintf("SELECT _tidb_rowid FROM %s.%s LIMIT 1", dt.schema, dt.table)
 
 	tx := dt.d.newTx()
-	_, err := tx.Query(query)
+	rows, err := tx.Query(query)
 
 	if err != nil {
 		dt.primaryKey = dt.likelyPrimaryKey
@@ -69,6 +69,7 @@ func (dt *dumpTable) discoverPrimaryKey() {
 		dt.primaryKey = "_tidb_rowid"
 	}
 
+	rows.Close()
 	tx.Commit()
 
 	return
