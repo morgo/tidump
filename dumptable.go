@@ -88,7 +88,8 @@ func (dt *dumpTable) discoverTableMinMax() {
 	tx.Commit()
 
 	if err != nil {
-		log.Fatalf("Could not determine min/max values for table: %s.%s", dt.schema, dt.table)
+		dt.min = 0 // Table likely has
+		dt.max = 0 // zero rows
 	}
 
 	return
@@ -120,7 +121,7 @@ func (dt *dumpTable) dumpCreateTable() {
 	tx.Commit()
 
 	if err != nil {
-		log.Fatal("Could not SHOW CREATE TABLE for %s.%s", dt.schema, dt.table)
+		log.Fatal("Could not SHOW CREATE TABLE for %s.%s: %s", dt.schema, dt.table, err)
 	}
 
 	dt.createTable = fmt.Sprintf("%s;\n", dt.createTable)

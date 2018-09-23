@@ -24,14 +24,12 @@ type dumpFile struct {
 	zlen   *int64 // actual bytes
 }
 
-func (dt *dumpTable) NewDumpFile(start int64, end int64) (*dumpFile, error) {
+func (dt *dumpTable) NewDumpFile(start int64, end int64) (df *dumpFile, err error) {
 
 	dt.d.dumpWg.Add(1)
 	atomic.AddInt64(&dt.d.totalFiles, 1)
 
-	var err error
-
-	df := &dumpFile{
+	df = &dumpFile{
 		start: start,
 		end:   end,
 		dt:    dt,
@@ -63,7 +61,7 @@ func (dt *dumpTable) NewDumpFile(start int64, end int64) (*dumpFile, error) {
 
 	df.zlen = new(int64)
 
-	return df, nil
+	return
 
 }
 

@@ -22,11 +22,34 @@ func (d *dumper) copyFileToS3(filename string) {
 
 	atomic.AddInt64(&d.filesDumpCompleted, 1) // creating the file finished
 	d.s3Wg.Add(1)
-	go d.doCopyFileToS3(filename)
+	go d.doCopyFileToS3(filename, true)
 
 }
 
-func (d *dumper) doCopyFileToS3(filename string) {
+func (d *dumper) s3isWritable() bool {
+
+	filename := fmt.Sprintf("%s/metadata.json", d.cfg.TmpDir)
+	f, err := os.Create(filename)
+
+	if err != nil {
+		log.Fatalf("Could not create temporary file: %s", err)
+	}
+
+	n, err := f.WriteString("{}}")
+
+	if err != nil {
+		log.Fatal("Could not write %d bytes to temporary file: %s", n, filename)
+	}
+
+	f.Close()
+
+	d.doCopyFileToS3(filename, false)
+
+	return true
+
+}
+
+func (d *dumper) doCopyFileToS3(filename string, count bool) {
 
 	file, err := os.Open(filename)
 	if err != nil {
@@ -60,15 +83,18 @@ func (d *dumper) doCopyFileToS3(filename string) {
 	<-d.s3Semaphore // Unlock
 
 	if err != nil {
-		log.Fatalf("S3 write error: %s", err)
+		log.Warningf("%s", err)
+		log.Fatalf(`This program does not accept credentials for AWS resources.
+If you are using on EC2, please assign a role to the instance with S3 permissions.  If you are not on EC2, install the aws cli tools and run 'aws configure'.`)
 	}
 
 	log.Debugf("Successfully uploaded %s to %s", filename, result.Location)
 
-	atomic.AddInt64(&d.filesCopyCompleted, 1)
-	fi, _ := file.Stat()
-	atomic.AddInt64(&d.bytesCopied, fi.Size())
-
-	d.s3Wg.Done()
+	if count {
+		atomic.AddInt64(&d.filesCopyCompleted, 1)
+		fi, _ := file.Stat()
+		atomic.AddInt64(&d.bytesCopied, fi.Size())
+		d.s3Wg.Done()
+	}
 
 }

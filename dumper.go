@@ -20,8 +20,6 @@ type dumper struct {
 	filesDumpCompleted int64
 	filesCopyCompleted int64
 	totalFiles         int64
-	mySQLNow           string // not configurable yet.
-	hostname           string
 	dumpWg             *sync.WaitGroup
 	s3Wg               *sync.WaitGroup
 	s3Semaphore        chan struct{}
@@ -95,7 +93,6 @@ func (d *dumper) Dump() {
 	d.cleanupTmpDir()
 	d.db.Close()
 	d.status() // print status before exiting
-
 	return
 
 }
@@ -103,11 +100,10 @@ func (d *dumper) Dump() {
 func (d *dumper) status() {
 
 	freeSpace := d.cfg.TmpDirMax - (d.bytesWritten - d.bytesCopied)
-	// TODO: format in MiB
 
-	log.Infof("Total Files: %d, Files Written: %d, Files Copied: %d", d.totalFiles, d.filesDumpCompleted, d.filesCopyCompleted)
-	log.Infof("Bytes Dumped: %d, Bytes Written (gz): %d Copied to S3: %d", d.bytesDumped, d.bytesWritten, d.bytesCopied)
-	log.Infof("tmpsize: %d", d.bytesWritten-d.bytesCopied)
+	log.Infof("Dumped: %d/%d Copied %d/%d", d.filesDumpCompleted, d.totalFiles, d.filesCopyCompleted, d.totalFiles)
+	log.Infof("Bytes Dumped: %s, Bytes Written (gz): %s Copied to S3: %s", byteCountBinary(d.bytesDumped), byteCountBinary(d.bytesWritten), byteCountBinary(d.bytesCopied))
+	log.Infof("tmpsize: %s", byteCountBinary(d.bytesWritten-d.bytesCopied))
 	log.Debugf("Goroutines in existence: %d", runtime.NumGoroutine())
 
 	if freeSpace <= d.cfg.FileTargetSize {
@@ -127,22 +123,51 @@ func (d *dumper) publishStatus() {
 
 // Some of this could be moved to config.
 
-func (d *dumper) preflightChecks() {
-
-	time.Sleep(time.Second) // finish this second first
-	query := "SELECT @@hostname, NOW()-INTERVAL 1 SECOND"
+func (d *dumper) preflightChecks() (err error) {
 
 	tx := d.newTx()
-	err := tx.QueryRow(query).Scan(&d.hostname, &d.mySQLNow)
-	tx.Commit()
+	defer tx.Commit()
 
-	if err != nil {
-		log.Fatalf("Could not get server time for tidb_snapshot: %s", err)
+	if len(d.cfg.AwsS3Bucket) == 0 {
+		log.Fatalf("Please specify an S3 bucket.  For example: tidump -s3-bucket backups.tocker.ca")
 	}
 
-	// @TODO: don't use startime but tidb_snapshot time!
-	d.cfg.AwsS3BucketPrefix = fmt.Sprintf("tidump-%s/%s", d.hostname, startTime.Format("2006-01-02"))
-	log.Infof("Uploading to %s/%s", d.cfg.AwsS3Bucket, d.cfg.AwsS3BucketPrefix)
+	/* Auto create a tidb snapshot */
+
+	if len(d.cfg.TidbSnapshot) == 0 {
+
+		time.Sleep(time.Second) // finish this second first
+
+		query := "SELECT NOW()-INTERVAL 1 SECOND"
+		err = tx.QueryRow(query).Scan(&d.cfg.TidbSnapshot)
+
+		if err != nil {
+			log.Fatalf("Could not get server time for tidb_snapshot: %s", err)
+		}
+
+	}
+
+	/* Auto create a S3 prefix */
+
+	if len(d.cfg.AwsS3BucketPrefix) == 0 {
+
+		var hostname string
+
+		query := "SELECT @@hostname"
+		err = tx.QueryRow(query).Scan(&hostname)
+
+		if err != nil {
+			log.Fatalf("Could not get server hostname: %s", err)
+		}
+
+		t, err := time.Parse("2006-01-02 15:04:05", d.cfg.TidbSnapshot)
+		if err != nil {
+			log.Fatalf("Could not parse time: %s", err)
+		}
+		d.cfg.AwsS3BucketPrefix = fmt.Sprintf("tidump-%s/%s", hostname, t.Format("2006-01-02"))
+		log.Infof("Uploading to s3://%s/%s", d.cfg.AwsS3Bucket, d.cfg.AwsS3BucketPrefix)
+
+	}
 
 	/*
 	 Make a directory to write temporary dump files.
@@ -155,6 +180,12 @@ func (d *dumper) preflightChecks() {
 	if err != nil {
 		log.Fatalf("Could not create tempdir: %s", err)
 	}
+
+	if !d.s3isWritable() {
+		log.Fatalf("Could not write to S3 Location: ", d.cfg.AwsS3Bucket)
+	}
+
+	return
 
 }
 
@@ -187,7 +218,7 @@ func (d *dumper) newTx() *sql.Tx {
 		log.Fatalf("Could not begin new transaction: %s", err)
 	}
 
-	query := fmt.Sprintf("SET tidb_snapshot = '%s', tidb_force_priority = 'low_priority'", d.mySQLNow)
+	query := fmt.Sprintf("SET tidb_snapshot = '%s', tidb_force_priority = 'low_priority'", d.cfg.TidbSnapshot)
 	_, err = tx.Exec(query)
 
 	if err != nil {
