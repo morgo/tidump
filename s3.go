@@ -49,7 +49,7 @@ func (d *dumper) s3isWritable() bool {
 
 }
 
-func (d *dumper) doCopyFileToS3(filename string, count bool) {
+func (d *dumper) doCopyFileToS3(filename string, counts bool) {
 
 	file, err := os.Open(filename)
 	if err != nil {
@@ -90,7 +90,7 @@ If you are using on EC2, please assign a role to the instance with S3 permission
 
 	log.Debugf("Successfully uploaded %s to %s", filename, result.Location)
 
-	if count {
+	if counts {
 		atomic.AddInt64(&d.filesCopyCompleted, 1)
 		fi, _ := file.Stat()
 		atomic.AddInt64(&d.bytesCopied, fi.Size())

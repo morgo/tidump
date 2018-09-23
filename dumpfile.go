@@ -163,7 +163,7 @@ func (df *dumpFile) dump() {
 	for rows.Next() {
 		err = rows.Scan(dest...)
 		if err != nil {
-			fmt.Println("Failed to scan row", err)
+			log.Fatalf("Failed to scan row: %s", err)
 			return
 		}
 
