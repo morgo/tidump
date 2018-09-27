@@ -10,7 +10,7 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/ngaut/log"
+	"go.uber.org/zap"
 )
 
 type dumper struct {
@@ -31,7 +31,7 @@ func NewDumper(cfg *Config) (*dumper, error) {
 
 	db, err := sql.Open("mysql", cfg.MySQLConnection)
 	if err != nil {
-		log.Fatal("Could not connect to MySQL at %s.", cfg.MySQLConnection)
+		zap.S().Fatalf("Could not connect to MySQL at %s.", cfg.MySQLConnection)
 	}
 
 	db.SetMaxOpenConns(cfg.MySQLPoolSize)
@@ -63,7 +63,7 @@ func (d *dumper) Dump() {
 	rows, err := tx.Query(query)
 
 	if err != nil {
-		log.Fatalf("Check MySQL connection is configured correctly: %s", err)
+		zap.S().Fatalf("Check MySQL connection is configured correctly: %s", err)
 	}
 
 	for rows.Next() {
@@ -72,7 +72,7 @@ func (d *dumper) Dump() {
 
 		err = rows.Scan(&dt.schema, &dt.table, &dt.avgRowLength, &dt.dataLength, &dt.likelyPrimaryKey, &dt.insertableColumns)
 		if err != nil {
-			log.Fatal("Check MySQL connection is configured correctly.")
+			zap.S().Fatal("Check MySQL connection is configured correctly.")
 		}
 
 		dt.dump()
@@ -102,13 +102,13 @@ func (d *dumper) status() {
 
 	freeSpace := d.cfg.TmpDirMax - (d.bytesWritten - d.bytesCopied)
 
-	log.Infof("Dumped: %d/%d Copied %d/%d", d.filesDumpCompleted, d.totalFiles, d.filesCopyCompleted, d.totalFiles)
-	log.Infof("Bytes Dumped: %s, Bytes Written (gz): %s Copied to S3: %s", byteCountBinary(d.bytesDumped), byteCountBinary(d.bytesWritten), byteCountBinary(d.bytesCopied))
-	log.Infof("tmpsize: %s", byteCountBinary(d.bytesWritten-d.bytesCopied))
-	log.Debugf("Goroutines in existence: %d", runtime.NumGoroutine())
+	zap.S().Infof("Dumped: %d/%d Copied %d/%d", d.filesDumpCompleted, d.totalFiles, d.filesCopyCompleted, d.totalFiles)
+	zap.S().Infof("Bytes Dumped: %s, Bytes Written (gz): %s Copied to S3: %s", byteCountBinary(d.bytesDumped), byteCountBinary(d.bytesWritten), byteCountBinary(d.bytesCopied))
+	zap.S().Infof("tmpsize: %s", byteCountBinary(d.bytesWritten-d.bytesCopied))
+	zap.S().Debugf("Goroutines in existence: %d", runtime.NumGoroutine())
 
 	if freeSpace <= d.cfg.FileTargetSize {
-		log.Warningf("Low free space: %d bytes", freeSpace)
+		zap.S().Warnf("Low free space: %d bytes", freeSpace)
 	}
 
 }
@@ -127,7 +127,7 @@ func (d *dumper) publishStatus() {
 func (d *dumper) preflightChecks() (err error) {
 
 	if len(d.cfg.AwsS3Bucket) == 0 {
-		log.Fatalf("Please specify an S3 bucket.  For example: tidump -s3-bucket backups.tocker.ca")
+		zap.S().Fatal("Please specify an S3 bucket.  For example: tidump -s3-bucket backups.tocker.ca")
 	}
 
 	tx := d.newTx()
@@ -143,7 +143,7 @@ func (d *dumper) preflightChecks() (err error) {
 		err = tx.QueryRow(query).Scan(&d.cfg.TidbSnapshot)
 
 		if err != nil {
-			log.Fatalf("Could not get server time for tidb_snapshot: %s", err)
+			zap.S().Fatalf("Could not get server time for tidb_snapshot: %s", err)
 		}
 
 	}
@@ -158,15 +158,15 @@ func (d *dumper) preflightChecks() (err error) {
 		err = tx.QueryRow(query).Scan(&hostname)
 
 		if err != nil {
-			log.Fatalf("Could not get server hostname: %s", err)
+			zap.S().Fatalf("Could not get server hostname: %s", err)
 		}
 
 		t, err := time.Parse("2006-01-02 15:04:05", d.cfg.TidbSnapshot)
 		if err != nil {
-			log.Fatalf("Could not parse time: %s", err)
+			zap.S().Fatalf("Could not parse time: %s", err)
 		}
 		d.cfg.AwsS3BucketPrefix = fmt.Sprintf("tidump-%s/%s", hostname, t.Format("2006-01-02"))
-		log.Infof("Uploading to s3://%s/%s", d.cfg.AwsS3Bucket, d.cfg.AwsS3BucketPrefix)
+		zap.S().Infof("Uploading to s3://%s/%s", d.cfg.AwsS3Bucket, d.cfg.AwsS3BucketPrefix)
 
 	}
 
@@ -176,14 +176,14 @@ func (d *dumper) preflightChecks() (err error) {
 	*/
 
 	d.cfg.TmpDir, err = ioutil.TempDir("", "tidump")
-	log.Infof("Writing temporary files to: %s", d.cfg.TmpDir)
+	zap.S().Infof("Writing temporary files to: %s", d.cfg.TmpDir)
 
 	if err != nil {
-		log.Fatalf("Could not create tempdir: %s", err)
+		zap.S().Fatalf("Could not create tempdir: %s", err)
 	}
 
 	if !d.s3isWritable() {
-		log.Fatalf("Could not write to S3 Location: ", d.cfg.AwsS3Bucket)
+		zap.S().Fatal("Could not write to S3 Location: ", d.cfg.AwsS3Bucket)
 	}
 
 	return
@@ -216,14 +216,14 @@ func (d *dumper) newTx() *sql.Tx {
 	tx, err := d.db.Begin()
 
 	if err != nil {
-		log.Fatalf("Could not begin new transaction: %s", err)
+		zap.S().Fatal("Could not begin new transaction: %s", err)
 	}
 
 	query := fmt.Sprintf("SET tidb_snapshot = '%s', tidb_force_priority = 'low_priority'", d.cfg.TidbSnapshot)
 	_, err = tx.Exec(query)
 
 	if err != nil {
-		log.Fatalf("Could not set tidb_snapshot: %s", err)
+		zap.S().Fatalf("Could not set tidb_snapshot: %s", err)
 	}
 
 	return tx
@@ -282,7 +282,7 @@ func (d *dumper) canSafelyWriteToTmpdir(nBytes int64) bool {
 			time.Sleep(5 * time.Second) // Waiting on S3 copy.
 			continue                    // the status thread will warn low/no free space.
 		} else {
-			log.Debugf("Free Space: %d, Requested: %d", freeSpace, nBytes)
+			zap.S().Debugf("Free Space: %d, Requested: %d", freeSpace, nBytes)
 			break
 		}
 

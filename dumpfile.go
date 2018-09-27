@@ -5,10 +5,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"fmt"
-	"github.com/ngaut/log"
 	"os"
 	"strings"
 	"sync/atomic"
+
+	"go.uber.org/zap"
 )
 
 type dumpFile struct {
@@ -52,7 +53,7 @@ func (dt *dumpTable) NewDumpFile(start int64, end int64) (df *dumpFile, err erro
 	df.fi, err = os.Create(df.file)
 
 	if err != nil {
-		log.Fatalf("Error in creating file: %s", df.file)
+		zap.S().Fatalf("Error in creating file: %s", df.file)
 	}
 
 	df.gf = gzip.NewWriter(df.fi)
@@ -126,7 +127,7 @@ func (df dumpFile) flush() {
 		df.updateBytesWritten(false)
 
 		if err != nil {
-			log.Fatal("Could not write to gz file: %s", df.file)
+			zap.S().Fatal("Could not write to gz file: %s", df.file)
 		}
 
 		df.buffer.Reset()
@@ -141,10 +142,10 @@ func (df *dumpFile) dump() {
 	tx := df.dt.d.newTx()
 
 	rows, err := tx.Query(df.sql)
-	log.Debug(df.sql)
+	zap.S().Debug(df.sql)
 
 	if err != nil {
-		log.Fatal("Could not retrieve table data: %s, error: %s", df.dt.schema, df.dt.table, err)
+		zap.S().Fatalf("Could not retrieve table data: %s, error: %s", df.dt.schema, df.dt.table, err)
 	}
 
 	cols, _ := rows.Columns()
@@ -163,7 +164,7 @@ func (df *dumpFile) dump() {
 	for rows.Next() {
 		err = rows.Scan(dest...)
 		if err != nil {
-			log.Fatalf("Failed to scan row: %s", err)
+			zap.S().Fatalf("Failed to scan row: %s", err)
 			return
 		}
 

@@ -2,10 +2,11 @@ package main
 
 import (
 	"fmt"
-	"github.com/ngaut/log"
 	"os"
 	"path/filepath"
 	"sync/atomic"
+
+	"go.uber.org/zap"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -32,13 +33,13 @@ func (d *dumper) s3isWritable() bool {
 	f, err := os.Create(filename)
 
 	if err != nil {
-		log.Fatalf("Could not create temporary file: %s", err)
+		zap.S().Fatalf("Could not create temporary file: %s", err)
 	}
 
 	n, err := f.WriteString("{}}")
 
 	if err != nil {
-		log.Fatal("Could not write %d bytes to temporary file: %s", n, filename)
+		zap.S().Fatalf("Could not write %d bytes to temporary file: %s", n, filename)
 	}
 
 	f.Close()
@@ -53,7 +54,7 @@ func (d *dumper) doCopyFileToS3(filename string, counts bool) {
 
 	file, err := os.Open(filename)
 	if err != nil {
-		log.Fatalf("Could not open file for upload: %s", filename)
+		zap.S().Fatalf("Could not open file for upload: %s", filename)
 	}
 
 	defer file.Close()
@@ -63,7 +64,7 @@ func (d *dumper) doCopyFileToS3(filename string, counts bool) {
 	sess := session.New(&conf)
 	svc := s3manager.NewUploader(sess)
 
-	log.Debugf("Uploading file to S3: %s", filename)
+	zap.S().Debugf("Uploading file to S3: %s", filename)
 
 	/*
 	 Reduce concurrent uploads so that *some* files make it completely.
@@ -83,12 +84,12 @@ func (d *dumper) doCopyFileToS3(filename string, counts bool) {
 	<-d.s3Semaphore // Unlock
 
 	if err != nil {
-		log.Warningf("%s", err)
-		log.Fatalf(`This program does not accept credentials for AWS resources.
+		zap.S().Warn(err)
+		zap.S().Fatal(`This program does not accept credentials for AWS resources.
 If you are using on EC2, please assign a role to the instance with S3 permissions.  If you are not on EC2, install the aws cli tools and run 'aws configure'.`)
 	}
 
-	log.Debugf("Successfully uploaded %s to %s", filename, result.Location)
+	zap.S().Debugf("Successfully uploaded %s to %s", filename, result.Location)
 
 	if counts {
 		atomic.AddInt64(&d.filesCopyCompleted, 1)

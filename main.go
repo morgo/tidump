@@ -18,11 +18,11 @@ package main
 
 import (
 	"flag"
-	"github.com/pingcap/errors"
-	"github.com/ngaut/log"
 	"os"
-	"strings"
 	"time"
+
+	"github.com/pingcap/errors"
+	"go.uber.org/zap"
 )
 
 // Structure
@@ -31,6 +31,9 @@ import (
 var startTime = time.Now()
 
 func main() {
+	log, _ := zap.NewDevelopmentConfig().Build()
+	log.Sugar()
+	zap.ReplaceGlobals(log)
 
 	cfg := NewConfig()
 	err := cfg.Parse(os.Args[1:])
@@ -39,20 +42,17 @@ func main() {
 	case flag.ErrHelp:
 		os.Exit(0)
 	default:
-		log.Errorf("parse cmd flags err %s\n", err)
+		zap.S().Error("parse cmd flags err %s\n", err)
 		os.Exit(2)
 	}
 
-	log.SetLevelByString(strings.ToLower(cfg.LogLevel))
-	if len(cfg.LogFile) > 0 {
-		log.SetOutputByName(cfg.LogFile)
-		log.SetHighlighting(false)
-	}
+	level := zap.AtomicLevel{}
+	level.UnmarshalText([]byte(cfg.LogLevel))
 
 	d, _ := NewDumper(cfg)
 	d.Dump() // start main loop.
 
 	t := time.Now()
-	log.Infof("Completed in %s seconds.", t.Sub(startTime))
+	zap.S().Info("Completed in %s seconds.", t.Sub(startTime))
 
 }
