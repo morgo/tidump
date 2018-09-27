@@ -2,11 +2,12 @@ package main
 
 import (
 	"fmt"
-	_ "github.com/go-sql-driver/mysql"
-	"github.com/ngaut/log"
 	"math"
 	"os"
 	"sync/atomic"
+
+	_ "github.com/go-sql-driver/mysql"
+	"go.uber.org/zap"
 )
 
 type dumpTable struct {
@@ -122,7 +123,7 @@ func (dt *dumpTable) dumpCreateTable() {
 	tx.Commit()
 
 	if err != nil {
-		log.Fatal("Could not SHOW CREATE TABLE for %s.%s: %s", dt.schema, dt.table, err)
+		zap.S().Fatalf("Could not SHOW CREATE TABLE for %s.%s: %s", dt.schema, dt.table, err)
 	}
 
 	dt.createTable = fmt.Sprintf("%s;\n", dt.createTable)
@@ -133,13 +134,13 @@ func (dt *dumpTable) dumpCreateTable() {
 		defer f.Close()
 
 		if err != nil {
-			log.Fatal("Could not create temporary file: %s", dt.schemaFile)
+			zap.S().Fatalf("Could not create temporary file: %s", dt.schemaFile)
 		}
 
 		n, err := f.WriteString(dt.createTable)
 
 		if err != nil {
-			log.Fatal("Could not write %d bytes to temporary file: %s", n, dt.schemaFile)
+			zap.S().Fatalf("Could not write %d bytes to temporary file: %s", n, dt.schemaFile)
 		}
 
 		atomic.AddInt64(&dt.d.bytesDumped, int64(n))

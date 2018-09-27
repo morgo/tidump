@@ -4,9 +4,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+
 	"github.com/BurntSushi/toml"
 	"github.com/pingcap/errors"
-	"github.com/ngaut/log"
+	"go.uber.org/zap"
 )
 
 func NewConfig() *Config {
@@ -26,7 +27,6 @@ func NewConfig() *Config {
 	fs.StringVar(&cfg.TidbSnapshot, "tidb-snapshot", "", "Set the backup to a point in time.")
 
 	fs.StringVar(&cfg.LogLevel, "L", "info", "Loader log level: debug, info, warn, error, fatal")
-	//log file
 
 	fs.Int64Var(&cfg.FileTargetSize, "file-target-size", (100 * 1024 * 1024), "Target size of files")
 	fs.Int64Var(&cfg.BulkInsertLimit, "bulk-insert-limit", (16 * 1024 * 1024), "Bulk insert limit")
@@ -49,7 +49,6 @@ type Config struct {
 	MySQLPoolSize     int    `toml:"mysql-pool-size" json:"mysql-pool-size"`
 	TidbSnapshot      string `toml:"tidb-snapshot" json:"tidb-snapshot"`
 	LogLevel          string `toml:"log-level" json:"log-level"`
-	LogFile           string `toml:"log-file" json:"log-file"`
 	TmpDir            string `toml:"tmpdir" json:"tmpdir"` // does nothing yet
 	FileTargetSize    int64  `toml:"file-target-size" json:"file-target-size"`
 	BulkInsertLimit   int64  `toml:"bulk-insert-limit" json:"bulk-insert-limit"`
@@ -61,7 +60,7 @@ type Config struct {
 func (c *Config) String() string {
 	bytes, err := json.Marshal(c)
 	if err != nil {
-		log.Errorf("[loader] marshal config to json error %v", err)
+		zap.S().Errorf("[loader] marshal config to json error %v", err)
 	}
 	return string(bytes)
 }
