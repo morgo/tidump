@@ -30,29 +30,39 @@ import (
 
 var startTime = time.Now()
 
+func panicError(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
 func main() {
-	log, _ := zap.NewDevelopmentConfig().Build()
-	log.Sugar()
-	zap.ReplaceGlobals(log)
+	logCfg := zap.NewDevelopmentConfig()
+	logInit, err := logCfg.Build()
+	panicError(err)
+	log := logInit.Sugar()
 
 	cfg := NewConfig()
-	err := cfg.Parse(os.Args[1:])
+	err = cfg.Parse(os.Args[1:])
 	switch errors.Cause(err) {
 	case nil:
 	case flag.ErrHelp:
 		os.Exit(0)
 	default:
-		zap.S().Error("parse cmd flags err %s\n", err)
+		log.Error("parse cmd flags err %s\n", err)
 		os.Exit(2)
 	}
 
 	level := zap.AtomicLevel{}
-	level.UnmarshalText([]byte(cfg.LogLevel))
+	err = level.UnmarshalText([]byte(cfg.LogLevel))
+	panicError(err)
+	logCfg.Level = level
+	logLeveled, err := logCfg.Build()
+	zap.ReplaceGlobals(logLeveled)
 
 	d, _ := NewDumper(cfg)
 	d.Dump() // start main loop.
 
 	t := time.Now()
-	zap.S().Info("Completed in %s seconds.", t.Sub(startTime))
-
+	zap.S().Infof("Completed in %s seconds.", t.Sub(startTime))
 }
