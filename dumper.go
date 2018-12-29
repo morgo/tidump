@@ -136,38 +136,32 @@ func (d *dumper) preflightChecks() (err error) {
 	/* Auto create a tidb snapshot */
 
 	if len(d.cfg.TidbSnapshot) == 0 {
-
-		time.Sleep(time.Second) // finish this second first
-
-		query := "SELECT NOW()-INTERVAL 1 SECOND"
-		err = tx.QueryRow(query).Scan(&d.cfg.TidbSnapshot)
-
-		if err != nil {
+		query := "SHOW MASTER STATUS"
+		var file, dodb, ignoredb, gtid string
+		if err = tx.QueryRow(query).Scan(&file, &d.cfg.TidbSnapshot, &dodb, &ignoredb, &gtid); err != nil {
 			zap.S().Fatalf("Could not get server time for tidb_snapshot: %s", err)
 		}
-
 	}
 
 	/* Auto create a S3 prefix */
 
 	if len(d.cfg.AwsS3BucketPrefix) == 0 {
 
-		var hostname string
+		var hostname, ts string
 
 		query := "SELECT @@hostname"
-		err = tx.QueryRow(query).Scan(&hostname)
-
-		if err != nil {
+		if err = tx.QueryRow(query).Scan(&hostname); err != nil {
 			zap.S().Fatalf("Could not get server hostname: %s", err)
 		}
-
-		t, err := time.Parse("2006-01-02 15:04:05", d.cfg.TidbSnapshot)
-		if err != nil {
-			zap.S().Fatalf("Could not parse time: %s", err)
+		query = fmt.Sprintf("SELECT TIDB_PARSE_TSO(%s)", d.cfg.TidbSnapshot)
+		if err = tx.QueryRow(query).Scan(&ts); err != nil {
+			if t, err := time.Parse("2006-01-02 15:04:05", ts); err != nil {
+				zap.S().Fatalf("Could not parse time: %s", err)
+			} else {
+				d.cfg.AwsS3BucketPrefix = fmt.Sprintf("tidump-%s/%s", hostname, t.Format("2006-01-02"))
+				zap.S().Infof("Uploading to s3://%s/%s", d.cfg.AwsS3Bucket, d.cfg.AwsS3BucketPrefix)
+			}
 		}
-		d.cfg.AwsS3BucketPrefix = fmt.Sprintf("tidump-%s/%s", hostname, t.Format("2006-01-02"))
-		zap.S().Infof("Uploading to s3://%s/%s", d.cfg.AwsS3Bucket, d.cfg.AwsS3BucketPrefix)
-
 	}
 
 	/*
@@ -212,22 +206,17 @@ func (d *dumper) dumpUsers() bool {
 */
 
 func (d *dumper) newTx() *sql.Tx {
-
-	tx, err := d.db.Begin()
-
-	if err != nil {
+	if tx, err := d.db.Begin(); err != nil {
 		zap.S().Fatal("Could not begin new transaction: %s", err)
+	} else {
+		query := fmt.Sprintf("SET tidb_snapshot = '%s', tidb_force_priority = 'low_priority'", d.cfg.TidbSnapshot)
+		if _, err = tx.Exec(query); err != nil {
+			// skip temporarily: https://github.com/pingcap/tidb/issues/8887
+			// zap.S().Fatalf("Could not set tidb_snapshot: %s", err)
+		}
+		return tx
 	}
-
-	query := fmt.Sprintf("SET tidb_snapshot = '%s', tidb_force_priority = 'low_priority'", d.cfg.TidbSnapshot)
-	_, err = tx.Exec(query)
-
-	if err != nil {
-		zap.S().Fatalf("Could not set tidb_snapshot: %s", err)
-	}
-
-	return tx
-
+	return nil
 }
 
 /*
