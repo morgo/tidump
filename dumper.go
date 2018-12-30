@@ -155,6 +155,8 @@ func (d *dumper) preflightChecks() (err error) {
 		}
 		query = fmt.Sprintf("SELECT TIDB_PARSE_TSO(%s)", d.cfg.TidbSnapshot)
 		if err = tx.QueryRow(query).Scan(&ts); err != nil {
+			zap.S().Fatalf("Could not parse tso: %s", err)
+		} else {
 			if t, err := time.Parse("2006-01-02 15:04:05", ts); err != nil {
 				zap.S().Fatalf("Could not parse time: %s", err)
 			} else {
