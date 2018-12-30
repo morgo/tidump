@@ -31,21 +31,17 @@ func (d *dumper) s3isWritable() bool {
 
 	filename := fmt.Sprintf("%s/metadata.json", d.cfg.TmpDir)
 	f, err := os.Create(filename)
+	defer f.Close()
 
 	if err != nil {
 		zap.S().Fatalf("Could not create temporary file: %s", err)
 	}
 
-	n, err := f.WriteString("{}}")
-
-	if err != nil {
+	if n, err := f.WriteString("{}"); err != nil {
 		zap.S().Fatalf("Could not write %d bytes to temporary file: %s", n, filename)
 	}
 
-	f.Close()
-
 	d.doCopyFileToS3(filename, false)
-
 	return true
 
 }
