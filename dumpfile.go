@@ -12,6 +12,15 @@ import (
 	"go.uber.org/zap"
 )
 
+type dumpFileSummary struct {
+	sql    string
+	file   string
+	start  int64
+	end    int64
+	schema string
+	table  string
+}
+
 type dumpFile struct {
 	sql    string
 	file   string
@@ -21,48 +30,51 @@ type dumpFile struct {
 	gf     *gzip.Writer
 	fw     *bufio.Writer
 	buffer *bytes.Buffer
-	dt     *dumpTable
+	d      *dumper
 	zlen   *int64 // actual bytes
+	schema string
+	table  string
 }
 
-func (dt *dumpTable) NewDumpFile(start int64, end int64) (df *dumpFile, err error) {
+func NewDumpFileSummary(dt *dumpTable, start int64, end int64) (df *dumpFileSummary, err error) {
 
-	dt.d.dumpWg.Add(1)
-	atomic.AddInt64(&dt.d.totalFiles, 1)
-
-	df = &dumpFile{
+	df = &dumpFileSummary{
 		start: start,
 		end:   end,
-		dt:    dt,
 	}
 
 	startSql := "1=1"
 	endSql := "1=1"
 
 	if df.start != 0 {
-		startSql = fmt.Sprintf("%s > %d", df.dt.primaryKey, df.start)
+		startSql = fmt.Sprintf("%s > %d", dt.primaryKey, df.start)
 	}
 
 	if df.end != 0 {
-		endSql = fmt.Sprintf("%s < %d", df.dt.primaryKey, df.end)
+		endSql = fmt.Sprintf("%s < %d", dt.primaryKey, df.end)
 	}
 
-	df.sql = fmt.Sprintf("SELECT LOW_PRIORITY %s FROM `%s`.`%s` WHERE %s AND %s", df.dt.insertableColumns, df.dt.schema, df.dt.table, startSql, endSql)
-	df.file = fmt.Sprintf("%s/%s.%s.%d.sql.gz", df.dt.d.cfg.TmpDir, df.dt.schema, df.dt.table, df.start)
-
-	df.fi, err = os.Create(df.file)
-
-	if err != nil {
-		zap.S().Fatalf("Error in creating file: %s", df.file)
-	}
-
-	df.gf = gzip.NewWriter(df.fi)
-	df.fw = bufio.NewWriter(df.gf)
-	df.buffer = new(bytes.Buffer)
-
-	df.zlen = new(int64)
-
+	df.sql = fmt.Sprintf("SELECT LOW_PRIORITY %s FROM `%s`.`%s` WHERE %s AND %s", dt.insertableColumns, dt.schema, dt.table, startSql, endSql)
+	df.file = fmt.Sprintf("%s/%s.%s.%d.sql.gz", dt.d.cfg.TmpDir, dt.schema, dt.table, df.start)
+	df.schema = dt.schema
+	df.table = dt.table
 	return
+
+}
+
+func (dfs dumpFileSummary) dump(d *dumper) {
+
+	df := &dumpFile{
+		start:  dfs.start,
+		end:    dfs.end,
+		sql:    dfs.sql,
+		file:   dfs.file,
+		d:      d,
+		schema: dfs.schema,
+		table:  dfs.table,
+	}
+
+	df.dump()
 
 }
 
@@ -78,9 +90,7 @@ func (df dumpFile) close() {
 }
 
 func (df dumpFile) write(s string) (int, error) {
-
 	return df.buffer.WriteString(s)
-
 }
 
 func (df dumpFile) bufferLen() int {
@@ -110,7 +120,7 @@ func (df dumpFile) updateBytesWritten(final bool) {
 
 	diff := newzlen - *df.zlen
 
-	atomic.AddInt64(&df.dt.d.bytesWritten, diff)
+	atomic.AddInt64(&df.d.bytesWritten, diff)
 	*df.zlen = newzlen
 
 }
@@ -119,10 +129,10 @@ func (df dumpFile) flush() {
 
 	uncompressedLen := int64(df.bufferLen())
 
-	if df.dt.d.canSafelyWriteToTmpdir(uncompressedLen) {
+	if df.d.canSafelyWriteToTmpdir(uncompressedLen) {
 
 		n, err := df.buffer.WriteTo(df.fw)
-		atomic.AddInt64(&df.dt.d.bytesDumped, n) // adding uncompressed len
+		atomic.AddInt64(&df.d.bytesDumped, n) // adding uncompressed len
 
 		df.updateBytesWritten(false)
 
@@ -137,15 +147,26 @@ func (df dumpFile) flush() {
 
 func (df *dumpFile) dump() {
 
-	defer df.dt.d.dumpWg.Done()
+	var err error
 
-	tx := df.dt.d.newTx()
+	df.fi, err = os.Create(df.file)
+
+	if err != nil {
+		zap.S().Fatalf("Error in creating file: %s", df.file)
+	}
+
+	df.gf = gzip.NewWriter(df.fi)
+	df.fw = bufio.NewWriter(df.gf)
+	df.buffer = new(bytes.Buffer)
+	df.zlen = new(int64)
+
+	tx := df.d.newTx()
 
 	rows, err := tx.Query(df.sql)
 	zap.S().Debug(df.sql)
 
 	if err != nil {
-		zap.S().Fatalf("Could not retrieve table data: %s, error: %s", df.dt.schema, df.dt.table, err)
+		zap.S().Fatalf("Could not retrieve table data: %s, error: %s", df.schema, df.table, err)
 	}
 
 	cols, _ := rows.Columns()
@@ -186,13 +207,13 @@ func (df *dumpFile) dump() {
 
 		values := fmt.Sprintf("(%s)", strings.Join(result, ","))
 
-		if int64(df.bufferLen()+len(values)) > df.dt.d.cfg.BulkInsertLimit {
+		if int64(df.bufferLen()+len(values)) > df.d.cfg.BulkInsertLimit {
 			df.write(";\n")
 			df.flush()
 		}
 
 		if df.bufferLen() == 0 {
-			df.write(fmt.Sprintf("INSERT INTO %s (%s) VALUES \n%s", df.dt.table, colsstr, values))
+			df.write(fmt.Sprintf("INSERT INTO %s (%s) VALUES \n%s", df.table, colsstr, values))
 		} else {
 			df.write(",\n")
 			df.write(values)
@@ -211,6 +232,7 @@ func (df *dumpFile) dump() {
 	}
 
 	df.close()
-	df.dt.d.copyFileToS3(df.file)
+
+	df.d.queueFileToS3(df.file)
 
 }

@@ -14,47 +14,41 @@ import (
 )
 
 type dumper struct {
-	bytesDumped        int64 // uncompressed bytes dumped from TiDB
-	bytesWritten       int64 // compressed bytes written (will be less)
-	bytesCopied        int64 // actual bytes copied to S3
-	filesDumpCompleted int64
-	filesCopyCompleted int64
-	totalFiles         int64
-	dumpWg             *sync.WaitGroup
-	s3Wg               *sync.WaitGroup
-	s3Semaphore        chan struct{}
-	cfg                *Config
-	db                 *sql.DB // sql connection
+	bytesDumped   int64 // uncompressed bytes dumped from TiDB
+	bytesWritten  int64 // compressed bytes written (will be less)
+	bytesCopied   int64 // actual bytes copied to S3
+	mutex         *sync.Mutex
+	cfg           *Config
+	db            *sql.DB // sql connection
+	dumpWg        *sync.WaitGroup
+	s3Wg          *sync.WaitGroup
+	metaWg        *sync.WaitGroup
+	dumpFileQueue []*dumpFileSummary
+	s3FileQueue   []string
+	dumpDone      bool
 }
 
 func NewDumper(cfg *Config) (*dumper, error) {
-
 	db, err := sql.Open("mysql", cfg.MySQLConnection)
 	if err != nil {
 		zap.S().Fatalf("Could not connect to MySQL at %s.", cfg.MySQLConnection)
 	}
-
 	db.SetMaxOpenConns(cfg.MySQLPoolSize)
-
-	dumper := &dumper{
-		cfg:         cfg,
-		dumpWg:      new(sync.WaitGroup),
-		s3Wg:        new(sync.WaitGroup),
-		s3Semaphore: make(chan struct{}, cfg.AwsS3PoolSize),
-		db:          db,
-	}
-
-	return dumper, nil
-
+	return &dumper{
+		cfg:      cfg,
+		mutex:    &sync.Mutex{},
+		dumpWg:   new(sync.WaitGroup),
+		s3Wg:     new(sync.WaitGroup),
+		metaWg:   new(sync.WaitGroup),
+		db:       db,
+		dumpDone: false,
+	}, err
 }
 
 func (d *dumper) Dump() {
 
 	d.preflightChecks()
-
 	go d.publishStatus() // every few seconds
-
-	d.dumpUsers() // currently does nothing
 
 	tx := d.newTx()
 	tx.Exec("SET group_concat_max_len = 1024 * 1024")
@@ -67,20 +61,24 @@ func (d *dumper) Dump() {
 	}
 
 	for rows.Next() {
-
-		dt, _ := d.newDumpTable()
-
+		dt := d.newDumpTable()
 		err = rows.Scan(&dt.schema, &dt.table, &dt.avgRowLength, &dt.dataLength, &dt.likelyPrimaryKey, &dt.insertableColumns)
 		if err != nil {
 			zap.S().Fatal("Check MySQL connection is configured correctly.")
 		}
-
-		dt.dump()
-
+		go func(dt *dumpTable) {
+			dt.d.metaWg.Add(1)
+			dt.dump()
+			dt.d.metaWg.Done()
+		}(dt)
 	}
 
 	rows.Close()
 	tx.Commit() // return to pool.
+
+	zap.S().Info("Waiting for meta data colletion to finish")
+	d.metaWg.Wait() // wait for meta data to finish
+	zap.S().Info("Meta data collection done!")
 
 	/*
 	 The work is handled in goroutines.
@@ -88,7 +86,17 @@ func (d *dumper) Dump() {
 	 trigger a goroutine for copying to S3.
 	*/
 
+	d.status()
+
+	for i := 0; i < 16; i++ {
+		go d.startDumpFileQueueDrainer()
+	}
+	for i := 0; i < 6; i++ {
+		go d.startS3FileQueueDrainer()
+	}
+
 	d.dumpWg.Wait()
+	d.dumpDone = true
 	d.s3Wg.Wait()
 
 	d.cleanupTmpDir()
@@ -98,26 +106,60 @@ func (d *dumper) Dump() {
 
 }
 
+func (d *dumper) startDumpFileQueueDrainer() {
+	d.dumpWg.Add(1)
+	defer d.dumpWg.Done()
+	for {
+		d.mutex.Lock()
+		if len(d.dumpFileQueue) == 0 {
+			zap.S().Infof("Dump file queue is empty!")
+			d.mutex.Unlock()
+			return
+		}
+		var df *dumpFileSummary
+		df, d.dumpFileQueue = d.dumpFileQueue[len(d.dumpFileQueue)-1], d.dumpFileQueue[:len(d.dumpFileQueue)-1]
+		d.mutex.Unlock()
+		df.dump(d)
+		df = nil
+	}
+}
+
+func (d *dumper) startS3FileQueueDrainer() {
+	d.s3Wg.Add(1)
+	defer d.s3Wg.Done()
+	for {
+		d.mutex.Lock()
+		if len(d.s3FileQueue) > 0 {
+			var filename string
+			filename, d.s3FileQueue = d.s3FileQueue[len(d.s3FileQueue)-1], d.s3FileQueue[:len(d.s3FileQueue)-1]
+			d.mutex.Unlock()
+			d.doCopyFileToS3(filename, true)
+		} else {
+			zap.S().Infof("S3 copy queue is empty!")
+			d.mutex.Unlock()
+			// if the dumpWg is empty and this queue return
+			if d.dumpDone {
+				zap.S().Infof("Dump queue is also zero, exiting!")
+				return
+			}
+			zap.S().Infof("Sleeping and will then retry")
+			time.Sleep(time.Second)
+		}
+	}
+}
+
 func (d *dumper) status() {
-
-	freeSpace := d.cfg.TmpDirMax - (d.bytesWritten - d.bytesCopied)
-
-	zap.S().Infof("Dumped: %d/%d Copied %d/%d", d.filesDumpCompleted, d.totalFiles, d.filesCopyCompleted, d.totalFiles)
+	zap.S().Infof("len(dumpFileQueue): %d, len(s3FileQueue): %d", len(d.dumpFileQueue), len(d.s3FileQueue))
 	zap.S().Infof("Bytes Dumped: %s, Bytes Written (gz): %s Copied to S3: %s", byteCountBinary(d.bytesDumped), byteCountBinary(d.bytesWritten), byteCountBinary(d.bytesCopied))
 	zap.S().Infof("tmpsize: %s", byteCountBinary(d.bytesWritten-d.bytesCopied))
 	zap.S().Debugf("Goroutines in existence: %d", runtime.NumGoroutine())
-
-	if freeSpace <= d.cfg.FileTargetSize {
-		zap.S().Warnf("Low free space: %d bytes", freeSpace)
-	}
-
 }
 
 func (d *dumper) publishStatus() {
 
 	for {
 		d.status()
-		time.Sleep(5 * time.Second)
+		time.Sleep(10 * time.Second)
 	}
 
 }
@@ -263,24 +305,7 @@ WHERE
 */
 
 func (d *dumper) canSafelyWriteToTmpdir(nBytes int64) bool {
-
-	for {
-
-		freeSpace := d.cfg.TmpDirMax - d.bytesWritten
-
-		if nBytes > freeSpace {
-			runtime.Gosched()           // Give prority to other gorountines, this ones blocked.
-			time.Sleep(5 * time.Second) // Waiting on S3 copy.
-			continue                    // the status thread will warn low/no free space.
-		} else {
-			zap.S().Debugf("Free Space: %d, Requested: %d", freeSpace, nBytes)
-			break
-		}
-
-	}
-
 	return true
-
 }
 
 func (d *dumper) cleanupTmpDir() {

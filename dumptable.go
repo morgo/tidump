@@ -27,14 +27,10 @@ type dumpTable struct {
 	rowsPerFile int64
 }
 
-func (d *dumper) newDumpTable() (*dumpTable, error) {
-
-	dt := &dumpTable{
+func (d *dumper) newDumpTable() *dumpTable {
+	return &dumpTable{
 		d: d,
 	}
-
-	return dt, nil
-
 }
 
 func (dt *dumpTable) dump() {
@@ -42,10 +38,7 @@ func (dt *dumpTable) dump() {
 	dt.discoverPrimaryKey()
 	dt.discoverRowsPerFile()
 	dt.discoverTableMinMax()
-
-	dt.d.dumpWg.Add(1)
-	go dt.dumpCreateTable() // async dump create table
-
+	dt.dumpCreateTable()  // async dump create table
 	dt.prepareDumpFiles() // fan-out and async dump files
 
 }
@@ -110,10 +103,6 @@ func (dt *dumpTable) discoverRowsPerFile() {
 
 func (dt *dumpTable) dumpCreateTable() {
 
-	defer dt.d.dumpWg.Done()
-
-	atomic.AddInt64(&dt.d.totalFiles, 1)
-
 	query := fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", dt.schema, dt.table)
 	dt.schemaFile = fmt.Sprintf("%s/%s.%s-schema.sql", dt.d.cfg.TmpDir, dt.schema, dt.table)
 
@@ -145,7 +134,7 @@ func (dt *dumpTable) dumpCreateTable() {
 
 		atomic.AddInt64(&dt.d.bytesDumped, int64(n))
 		atomic.AddInt64(&dt.d.bytesWritten, int64(n)) // it was uncompresssed
-		dt.d.copyFileToS3(dt.schemaFile)
+		dt.d.doCopyFileToS3(dt.schemaFile, true)      // copy file
 
 	}
 
@@ -161,12 +150,10 @@ func (dt *dumpTable) dumpCreateTable() {
 func (dt *dumpTable) prepareDumpFiles() {
 
 	if dt.dataLength < dt.d.cfg.FileTargetSize {
-		df, _ := dt.NewDumpFile(0, 0) // small table
-		go df.dump()
+		df, _ := NewDumpFileSummary(dt, 0, 0) // small table
+		dt.d.dumpFileQueue = append(dt.d.dumpFileQueue, df)
 	} else {
-
 		for i := dt.min; i < dt.max; i += dt.rowsPerFile {
-
 			start := i
 			end := i + dt.rowsPerFile - 1
 
@@ -178,9 +165,8 @@ func (dt *dumpTable) prepareDumpFiles() {
 				end = 0
 			}
 
-			df, _ := dt.NewDumpFile(start, end)
-			go df.dump()
-
+			df, _ := NewDumpFileSummary(dt, start, end)
+			dt.d.dumpFileQueue = append(dt.d.dumpFileQueue, df)
 		}
 	}
 }

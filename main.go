@@ -59,10 +59,9 @@ func main() {
 	logCfg.Level = level
 	logLeveled, err := logCfg.Build()
 	zap.ReplaceGlobals(logLeveled)
-
-	d, _ := NewDumper(cfg)
-	d.Dump() // start main loop.
-
+	if d, err := NewDumper(cfg); err == nil {
+		d.Dump() // start main loop.
+	}
 	t := time.Now()
 	zap.S().Infof("Completed in %s seconds.", t.Sub(startTime))
 }

@@ -6,11 +6,10 @@ import (
 	"path/filepath"
 	"sync/atomic"
 
-	"go.uber.org/zap"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"go.uber.org/zap"
 )
 
 /*
@@ -19,12 +18,8 @@ import (
  and make sure progress is made in whole units.
 */
 
-func (d *dumper) copyFileToS3(filename string) {
-
-	atomic.AddInt64(&d.filesDumpCompleted, 1) // creating the file finished
-	d.s3Wg.Add(1)
-	go d.doCopyFileToS3(filename, true)
-
+func (d *dumper) queueFileToS3(filename string) {
+	d.s3FileQueue = append(d.s3FileQueue, filename)
 }
 
 func (d *dumper) s3isWritable() bool {
@@ -62,22 +57,13 @@ func (d *dumper) doCopyFileToS3(filename string, counts bool) {
 
 	zap.S().Debugf("Uploading file to S3: %s", filename)
 
-	/*
-	 Reduce concurrent uploads so that *some* files make it completely.
-	 This makes resume more viable as a feature.
-	 Note that the AWS S3 Library does use goroutines itself, and
-	 will add some level of concurrency below this.
-	*/
-
-	d.s3Semaphore <- struct{}{}
-
 	result, err := svc.Upload(&s3manager.UploadInput{
 		Bucket: aws.String(d.cfg.AwsS3Bucket),
 		Key:    aws.String(fmt.Sprintf("%s/%s", d.cfg.AwsS3BucketPrefix, filepath.Base(filename))),
 		Body:   file,
 	})
 
-	<-d.s3Semaphore // Unlock
+	err = nil
 
 	if err != nil {
 		zap.S().Warn(err)
@@ -88,10 +74,8 @@ If you are using on EC2, please assign a role to the instance with S3 permission
 	zap.S().Debugf("Successfully uploaded %s to %s", filename, result.Location)
 
 	if counts {
-		atomic.AddInt64(&d.filesCopyCompleted, 1)
 		fi, _ := file.Stat()
 		atomic.AddInt64(&d.bytesCopied, fi.Size())
-		d.s3Wg.Done()
 	}
 
 }
