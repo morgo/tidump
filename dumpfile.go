@@ -36,6 +36,12 @@ type dumpFile struct {
 	table  string
 }
 
+/*
+ DumpFileSummary is used to queue a file into the slice
+ containing incomplete work.  It should not point to
+ any file handles, as otherwise there can be a memory leak
+*/
+
 func NewDumpFileSummary(dt *dumpTable, start int64, end int64) (df *dumpFileSummary, err error) {
 
 	df = &dumpFileSummary{
@@ -62,7 +68,12 @@ func NewDumpFileSummary(dt *dumpTable, start int64, end int64) (df *dumpFileSumm
 
 }
 
-func (dfs dumpFileSummary) dump(d *dumper) {
+/*
+ Convert and unqueue a dumpFileSummary back to a
+ dumpFile and dump it.
+*/
+
+func (dfs dumpFileSummary) dump(d *dumper) error {
 
 	df := &dumpFile{
 		start:  dfs.start,
@@ -74,11 +85,11 @@ func (dfs dumpFileSummary) dump(d *dumper) {
 		table:  dfs.table,
 	}
 
-	df.dump()
+	return df.dump()
 
 }
 
-func (df dumpFile) close() {
+func (df dumpFile) Close() {
 
 	df.fw.Flush()
 	// Close the gzip first.
@@ -125,34 +136,29 @@ func (df dumpFile) updateBytesWritten(final bool) {
 
 }
 
-func (df dumpFile) flush() {
+func (df dumpFile) flush() error {
 
-	uncompressedLen := int64(df.bufferLen())
+	//uncompressedLen := int64(df.bufferLen())
+	n, err := df.buffer.WriteTo(df.fw)
+	atomic.AddInt64(&df.d.bytesDumped, n) // adding uncompressed len
 
-	if df.d.canSafelyWriteToTmpdir(uncompressedLen) {
-
-		n, err := df.buffer.WriteTo(df.fw)
-		atomic.AddInt64(&df.d.bytesDumped, n) // adding uncompressed len
-
-		df.updateBytesWritten(false)
-
-		if err != nil {
-			zap.S().Fatal("Could not write to gz file: %s", df.file)
-		}
-
-		df.buffer.Reset()
-	}
-
-}
-
-func (df *dumpFile) dump() {
-
-	var err error
-
-	df.fi, err = os.Create(df.file)
+	df.updateBytesWritten(false)
 
 	if err != nil {
+		zap.S().Fatal("Could not write to gz file: %s", df.file)
+		return err
+	}
+
+	df.buffer.Reset()
+	return nil
+}
+
+func (df *dumpFile) dump() (err error) {
+	defer df.Close()
+
+	if df.fi, err = os.Create(df.file); err != nil {
 		zap.S().Fatalf("Error in creating file: %s", df.file)
+		return err
 	}
 
 	df.gf = gzip.NewWriter(df.fi)
@@ -167,6 +173,7 @@ func (df *dumpFile) dump() {
 
 	if err != nil {
 		zap.S().Fatalf("Could not retrieve table data: %s, error: %s", df.schema, df.table, err)
+		return err
 	}
 
 	cols, _ := rows.Columns()
@@ -231,8 +238,9 @@ func (df *dumpFile) dump() {
 		df.flush()
 	}
 
-	df.close()
+	if err = df.d.queueFileToS3(df.file); err != nil {
+		return err
+	}
 
-	df.d.queueFileToS3(df.file)
-
+	return nil
 }

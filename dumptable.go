@@ -101,7 +101,7 @@ func (dt *dumpTable) discoverRowsPerFile() {
 	return
 }
 
-func (dt *dumpTable) dumpCreateTable() {
+func (dt *dumpTable) dumpCreateTable() error {
 
 	query := fmt.Sprintf("SHOW CREATE TABLE `%s`.`%s`", dt.schema, dt.table)
 	dt.schemaFile = fmt.Sprintf("%s/%s.%s-schema.sql", dt.d.cfg.TmpDir, dt.schema, dt.table)
@@ -117,27 +117,29 @@ func (dt *dumpTable) dumpCreateTable() {
 
 	dt.createTable = fmt.Sprintf("%s;\n", dt.createTable)
 
-	if dt.d.canSafelyWriteToTmpdir(int64(len(dt.createTable))) {
-
-		f, err := os.Create(dt.schemaFile)
-		defer f.Close()
-
-		if err != nil {
-			zap.S().Fatalf("Could not create temporary file: %s", dt.schemaFile)
-		}
-
-		n, err := f.WriteString(dt.createTable)
-
-		if err != nil {
-			zap.S().Fatalf("Could not write %d bytes to temporary file: %s", n, dt.schemaFile)
-		}
-
-		atomic.AddInt64(&dt.d.bytesDumped, int64(n))
-		atomic.AddInt64(&dt.d.bytesWritten, int64(n)) // it was uncompresssed
-		dt.d.doCopyFileToS3(dt.schemaFile, true)      // copy file
-
+	if err := dt.d.canSafelyWriteToTmpdir(int64(len(dt.createTable))); err != nil {
+		return err
 	}
 
+	f, err := os.Create(dt.schemaFile)
+	defer f.Close()
+
+	if err != nil {
+		zap.S().Fatalf("Could not create temporary file: %s", dt.schemaFile)
+		return err
+	}
+	if n, err := f.WriteString(dt.createTable); err != nil {
+		zap.S().Warnf("Could not write %d bytes to temporary file: %s", n, dt.schemaFile)
+		return err
+	} else {
+		atomic.AddInt64(&dt.d.bytesDumped, int64(n))
+		atomic.AddInt64(&dt.d.bytesWritten, int64(n)) // it was uncompresssed
+
+		if err := dt.d.doCopyFileToS3(dt.schemaFile); err != nil {
+			return err
+		}
+		return nil
+	}
 }
 
 /*

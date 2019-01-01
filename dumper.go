@@ -45,9 +45,12 @@ func NewDumper(cfg *Config) (*dumper, error) {
 	}, err
 }
 
-func (d *dumper) Dump() {
+func (d *dumper) Dump() error {
 
-	d.preflightChecks()
+	if err := d.preflightChecks(); err != nil {
+		return err
+	}
+
 	go d.publishStatus() // every few seconds
 
 	tx := d.newTx()
@@ -58,6 +61,7 @@ func (d *dumper) Dump() {
 
 	if err != nil {
 		zap.S().Fatalf("Check MySQL connection is configured correctly: %s", err)
+		return err
 	}
 
 	for rows.Next() {
@@ -65,6 +69,7 @@ func (d *dumper) Dump() {
 		err = rows.Scan(&dt.schema, &dt.table, &dt.avgRowLength, &dt.dataLength, &dt.likelyPrimaryKey, &dt.insertableColumns)
 		if err != nil {
 			zap.S().Fatal("Check MySQL connection is configured correctly.")
+			return err
 		}
 		go func(dt *dumpTable) {
 			dt.d.metaWg.Add(1)
@@ -102,7 +107,7 @@ func (d *dumper) Dump() {
 	d.cleanupTmpDir()
 	d.db.Close()
 	d.status() // print status before exiting
-	return
+	return nil
 
 }
 
@@ -116,11 +121,11 @@ func (d *dumper) startDumpFileQueueDrainer() {
 			d.mutex.Unlock()
 			return
 		}
-		var df *dumpFileSummary
-		df, d.dumpFileQueue = d.dumpFileQueue[len(d.dumpFileQueue)-1], d.dumpFileQueue[:len(d.dumpFileQueue)-1]
+		var dfs *dumpFileSummary
+		dfs, d.dumpFileQueue = d.dumpFileQueue[len(d.dumpFileQueue)-1], d.dumpFileQueue[:len(d.dumpFileQueue)-1]
 		d.mutex.Unlock()
-		df.dump(d)
-		df = nil
+		dfs.dump(d)
+		dfs = nil
 	}
 }
 
@@ -133,7 +138,9 @@ func (d *dumper) startS3FileQueueDrainer() {
 			var filename string
 			filename, d.s3FileQueue = d.s3FileQueue[len(d.s3FileQueue)-1], d.s3FileQueue[:len(d.s3FileQueue)-1]
 			d.mutex.Unlock()
-			d.doCopyFileToS3(filename, true)
+			if err := d.doCopyFileToS3(filename); err != nil {
+				zap.S().Fatalf("Failed to copy file: %s to S3", filename)
+			}
 		} else {
 			zap.S().Infof("S3 copy queue is empty!")
 			d.mutex.Unlock()
@@ -220,7 +227,7 @@ func (d *dumper) preflightChecks() (err error) {
 		zap.S().Fatalf("Could not create tempdir: %s", err)
 	}
 
-	if !d.s3isWritable() {
+	if err := d.s3isWritable(); err != nil {
 		zap.S().Fatal("Could not write to S3 Location: ", d.cfg.AwsS3Bucket)
 	}
 
@@ -304,8 +311,8 @@ WHERE
  could be exceeded.
 */
 
-func (d *dumper) canSafelyWriteToTmpdir(nBytes int64) bool {
-	return true
+func (d *dumper) canSafelyWriteToTmpdir(nBytes int64) error {
+	return nil
 }
 
 func (d *dumper) cleanupTmpDir() {
