@@ -54,9 +54,9 @@ func (d *dumper) doCopyFileToS3(filename string, counts bool) error {
 
 		defer func(counts bool, d *dumper, file *os.File, filename string) {
 			if counts {
-        fi, _ := file.Stat()
-			  atomic.AddInt64(&d.bytesCopied, fi.Size())
-      }
+				fi, _ := file.Stat()
+				atomic.AddInt64(&d.bytesCopied, fi.Size())
+			}
 			file.Close()
 			os.Remove(filename)
 		}(counts, d, file, filename)

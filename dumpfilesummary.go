@@ -1,13 +1,13 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
 	"fmt"
-  "os"
-  "bufio"
-  "bytes"
-  "compress/gzip"
+	"os"
 
-  "go.uber.org/zap"
+	"go.uber.org/zap"
 )
 
 type dumpFileSummary struct {
@@ -68,15 +68,15 @@ func (dfs dumpFileSummary) dump(d *dumper) (err error) {
 		table:  dfs.table,
 	}
 
-  if df.fi, err = os.Create(df.file); err != nil {
-    zap.S().Fatalf("Error in creating file: %s", df.file)
-    return err
-  }
+	if df.fi, err = os.Create(df.file); err != nil {
+		zap.S().Fatalf("Error in creating file: %s", df.file)
+		return err
+	}
 
-  df.gf = gzip.NewWriter(df.fi)
-  df.fw = bufio.NewWriter(df.gf)
-  df.buffer = new(bytes.Buffer)
-  df.zlen = new(int64)
+	df.gf = gzip.NewWriter(df.fi)
+	df.fw = bufio.NewWriter(df.gf)
+	df.buffer = new(bytes.Buffer)
+	df.zlen = new(int64)
 
 	return df.dump()
 
