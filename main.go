@@ -5,7 +5,9 @@
    auto-resume by reading a "metadata.json" file.  Which contains:
    - the tidb-snapshot
    - min/max/primary key/rows-per-file of tables included in backup.
-
+ * Add MySQL compatibility with FTWRL, followed by START TRANSACTION WITH CONSISTENT SNAPSHOT.
+ * Backup TiDB views (last)
+ * Keep trx's open for dump (for mysql compat, optimization)
 
 LIMITATIONS:
 * Does not backup users.  Waiting on TIDB #7733.
@@ -24,9 +26,6 @@ import (
 	"github.com/pingcap/errors"
 	"go.uber.org/zap"
 )
-
-// Structure
-// Dumper (d) -> DumpTable (dt) ->  DumpFile (df)
 
 var startTime = time.Now()
 
