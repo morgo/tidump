@@ -40,24 +40,26 @@ func (d *dumper) s3isWritable() error {
 		return err
 	}
 
-	if err := d.doCopyFileToS3(filename); err != nil {
+	if err := d.doCopyFileToS3(filename, false); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (d *dumper) doCopyFileToS3(filename string) error {
+func (d *dumper) doCopyFileToS3(filename string, counts bool) error {
 
 	if file, err := os.Open(filename); err != nil {
 		return err
 	} else {
 
-		defer func(d *dumper, file *os.File, filename string) {
-			fi, _ := file.Stat()
-			atomic.AddInt64(&d.bytesCopied, fi.Size())
+		defer func(counts bool, d *dumper, file *os.File, filename string) {
+			if counts {
+        fi, _ := file.Stat()
+			  atomic.AddInt64(&d.bytesCopied, fi.Size())
+      }
 			file.Close()
 			os.Remove(filename)
-		}(d, file, filename)
+		}(counts, d, file, filename)
 
 		conf := aws.Config{Region: aws.String(d.cfg.AwsS3Region)}
 		sess := session.New(&conf)

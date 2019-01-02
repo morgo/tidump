@@ -135,7 +135,7 @@ func (dt *dumpTable) dumpCreateTable() error {
 		atomic.AddInt64(&dt.d.bytesDumped, int64(n))
 		atomic.AddInt64(&dt.d.bytesWritten, int64(n)) // it was uncompresssed
 
-		if err := dt.d.doCopyFileToS3(dt.schemaFile); err != nil {
+		if err := dt.d.doCopyFileToS3(dt.schemaFile, true); err != nil {
 			return err
 		}
 		return nil

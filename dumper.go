@@ -117,7 +117,7 @@ func (d *dumper) startDumpFileQueueDrainer() {
 	for {
 		d.mutex.Lock()
 		if len(d.dumpFileQueue) == 0 {
-			zap.S().Infof("Dump file queue is empty!")
+			zap.S().Debugf("Dump file queue is empty!")
 			d.mutex.Unlock()
 			return
 		}
@@ -125,7 +125,7 @@ func (d *dumper) startDumpFileQueueDrainer() {
 		dfs, d.dumpFileQueue = d.dumpFileQueue[len(d.dumpFileQueue)-1], d.dumpFileQueue[:len(d.dumpFileQueue)-1]
 		d.mutex.Unlock()
 		dfs.dump(d)
-		dfs = nil
+		//dfs = nil
 	}
 }
 
@@ -138,18 +138,18 @@ func (d *dumper) startS3FileQueueDrainer() {
 			var filename string
 			filename, d.s3FileQueue = d.s3FileQueue[len(d.s3FileQueue)-1], d.s3FileQueue[:len(d.s3FileQueue)-1]
 			d.mutex.Unlock()
-			if err := d.doCopyFileToS3(filename); err != nil {
+			if err := d.doCopyFileToS3(filename, true); err != nil {
 				zap.S().Fatalf("Failed to copy file: %s to S3", filename)
 			}
 		} else {
-			zap.S().Infof("S3 copy queue is empty!")
+			zap.S().Debugf("S3 copy queue is empty!")
 			d.mutex.Unlock()
 			// if the dumpWg is empty and this queue return
 			if d.dumpDone {
-				zap.S().Infof("Dump queue is also zero, exiting!")
+				zap.S().Debugf("Dump queue is also zero, exiting!")
 				return
 			}
-			zap.S().Infof("Sleeping and will then retry")
+			zap.S().Debugf("Sleeping and will then retry")
 			time.Sleep(time.Second)
 		}
 	}
